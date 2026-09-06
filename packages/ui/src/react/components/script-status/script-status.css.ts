@@ -68,15 +68,32 @@ export const inProgressIcon = style({
   },
 });
 
+// Same geometry as the former 24-unit SVG: dot centers at 7.5 and 16.5 (a 75%
+// square of 9-unit cells) with a 4-unit diameter (44.4% of a cell).
+export const dotGrid = style({
+  '@layer': {
+    recipes: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(2, 1fr)',
+      gridTemplateRows: 'repeat(2, 1fr)',
+      placeItems: 'center',
+      width: '75%',
+      height: '75%',
+    },
+  },
+});
+
 export const dot = Array.from({ length: DOT_COUNT }, (_, index) =>
   style({
     '@layer': {
       recipes: {
-        fill: 'currentColor',
+        display: 'block',
+        width: '44.4%',
+        height: '44.4%',
+        borderRadius: '50%',
+        background: 'currentColor',
         opacity: 0.28,
         transform: 'scale(0.8)',
-        transformBox: 'fill-box',
-        transformOrigin: 'center',
         animationName: dotPulse,
         animationDuration: `${PERIOD_MS}ms`,
         animationTimingFunction: 'ease-in-out',

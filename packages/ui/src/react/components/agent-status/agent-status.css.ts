@@ -56,15 +56,32 @@ export const workingIcon = style({
   },
 });
 
+// Same geometry as the former 24-unit SVG: dot centers at 6, 12 and 18 (a 75%
+// square of 6-unit cells) with a 3.7-unit diameter (61.7% of a cell).
+export const dotGrid = style({
+  '@layer': {
+    recipes: {
+      display: 'grid',
+      gridTemplateColumns: 'repeat(3, 1fr)',
+      gridTemplateRows: 'repeat(3, 1fr)',
+      placeItems: 'center',
+      width: '75%',
+      height: '75%',
+    },
+  },
+});
+
 export const dot = Array.from({ length: DOT_COUNT }, (_, index) =>
   style({
     '@layer': {
       recipes: {
-        fill: 'currentColor',
+        display: 'block',
+        width: '61.7%',
+        height: '61.7%',
+        borderRadius: '50%',
+        background: 'currentColor',
         opacity: 0.28,
         transform: 'scale(0.72)',
-        transformBox: 'fill-box',
-        transformOrigin: 'center',
         animationName: dotShimmer,
         animationDuration: `${PERIOD_MS}ms`,
         animationTimingFunction: 'cubic-bezier(0.45, 0, 0.2, 1)',
