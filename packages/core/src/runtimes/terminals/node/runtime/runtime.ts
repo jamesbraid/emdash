@@ -39,6 +39,7 @@ import {
   makeTmuxSessionName,
   resolveTmuxSession,
   resolveLocalPtySpawn,
+  PTY_OUTPUT_COALESCE_MS,
   PtyRegistry,
   type PtySession,
   type PtySpawner,
@@ -454,7 +455,7 @@ export class TerminalsRuntime {
     const id = sessionKeyFor(key);
     let log = this.logs.get(id);
     if (!log) {
-      log = new LiveLogSource();
+      log = new LiveLogSource({ coalesceMs: PTY_OUTPUT_COALESCE_MS });
       this.logs.set(id, log);
     }
     return log;

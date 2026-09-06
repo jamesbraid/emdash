@@ -2,6 +2,13 @@ import type { LiveLogSourceOptions } from '@emdash/wire/live';
 import { LiveLogSource } from '@emdash/wire/live';
 import type { PtyExitInfo, PtyProcess, PtySpawnSpec } from './types';
 
+/**
+ * Pty output is batched into one live update per frame-sized window. Raw pty
+ * reads arrive as hundreds of tiny chunks a second while a TUI repaints, and
+ * each update becomes a wire message through every hop to the renderer.
+ */
+export const PTY_OUTPUT_COALESCE_MS = 16;
+
 export interface PtySessionOptions {
   log?: LiveLogSourceOptions;
   output?: LiveLogSource;
@@ -23,7 +30,8 @@ export class PtySession {
     private readonly process: PtyProcess,
     private readonly options: PtySessionOptions = {}
   ) {
-    this.output = options.output ?? new LiveLogSource(options.log);
+    this.output =
+      options.output ?? new LiveLogSource({ coalesceMs: PTY_OUTPUT_COALESCE_MS, ...options.log });
     this.process.onData((chunk) => {
       if (this.disposed) return;
       this.output.append(chunk);
@@ -31,6 +39,8 @@ export class PtySession {
       this.options.onStateChange?.();
     });
     this.process.onExit((info) => {
+      // Whatever the process wrote last must reach subscribers before exit.
+      this.output.flush();
       this.exitInfo = normalizeExitInfo(info);
       this.options.onExit?.(this.exitInfo);
       this.options.onStateChange?.();

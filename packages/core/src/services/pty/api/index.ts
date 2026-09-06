@@ -29,7 +29,7 @@ export {
 } from './process-tree';
 export { PtyRegistry } from './pty-registry';
 export type { PtyRegistryOptions } from './pty-registry';
-export { PtySession } from './pty-session';
+export { PTY_OUTPUT_COALESCE_MS, PtySession } from './pty-session';
 export type { PtySessionOptions } from './pty-session';
 export {
   buildTmuxShellLine,
