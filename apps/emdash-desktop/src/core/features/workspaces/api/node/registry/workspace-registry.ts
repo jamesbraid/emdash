@@ -266,8 +266,16 @@ export class WorkspaceRegistry {
     if (path !== undefined && path !== null) {
       const current = this.getLive(id, tx);
       if (current?.location) {
-        const owner = this.findLiveByPath(current.location, current.sshConnectionId, path, tx);
-        if (owner && owner.id !== id) throw workspacePathCollision(path, id, owner.id);
+        // Ownership can only change when the path identity changes. Registry
+        // deliveries refresh every workspace on every observation, so the
+        // unchanged case must stay a primary-key read, not a host-wide scan.
+        const moved =
+          current.path === null ||
+          workspacePathIdentityKey(current.path) !== workspacePathIdentityKey(path);
+        if (moved) {
+          const owner = this.findLiveByPath(current.location, current.sshConnectionId, path, tx);
+          if (owner && owner.id !== id) throw workspacePathCollision(path, id, owner.id);
+        }
         if (current.path !== null) persistedPath = stableWorkspacePathDisplay(current.path, path);
       }
     }
