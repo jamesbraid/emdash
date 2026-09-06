@@ -26,17 +26,11 @@ const STATUS_LABELS: Record<ActiveAgentStatusKind, string> = {
   completed: 'Agent completed',
 };
 
-const DOT_POINTS = [
-  [6, 6],
-  [12, 6],
-  [18, 6],
-  [6, 12],
-  [12, 12],
-  [18, 12],
-  [6, 18],
-  [12, 18],
-  [18, 18],
-] as const;
+// The working glyph is a 3x3 grid of dots. They are plain elements rather than
+// SVG children: Chromium runs opacity and transform animations on elements on
+// the compositor thread, but SVG children are restyled and repainted on the
+// renderer's main thread every frame, which with many working agents pinned it.
+const WORKING_DOT_COUNT = 9;
 
 function toCssLength(size: string | number) {
   return typeof size === 'number' ? `${size}px` : size;
@@ -86,11 +80,11 @@ function AgentStatusGlyph({ status }: { status: ActiveAgentStatusKind }) {
   switch (status) {
     case 'working':
       return (
-        <svg className={cx(styles.icon, styles.workingIcon)} viewBox="0 0 24 24" aria-hidden="true">
-          {DOT_POINTS.map(([cx, cy], index) => (
-            <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="1.85" className={styles.dot[index]} />
+        <span className={cx(styles.dotGrid, styles.workingIcon)} aria-hidden="true">
+          {Array.from({ length: WORKING_DOT_COUNT }, (_, index) => (
+            <span key={index} data-dot="" className={styles.dot[index]} />
           ))}
-        </svg>
+        </span>
       );
 
     case 'awaiting-input':

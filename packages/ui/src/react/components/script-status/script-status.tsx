@@ -21,16 +21,14 @@ const STATUS_LABELS: Record<ScriptStatusKind, string> = {
   cancelled: 'Cancelled',
 };
 
-// Clockwise animation order for a matrix laid out as:
+// The in-progress glyph is a 2x2 grid of dots rendered as plain elements so
+// their opacity and scale animate on the compositor thread rather than being
+// repainted every frame like SVG children. Rows render top-left, top-right,
+// bottom-left, bottom-right; the pulse travels clockwise, so the bottom row
+// swaps its animation phases:
 // [1, 2]
-// [3, 4]
-// The pulse therefore travels 1 → 2 → 4 → 3 → 1.
-const DOT_POINTS = [
-  [7.5, 7.5],
-  [16.5, 7.5],
-  [16.5, 16.5],
-  [7.5, 16.5],
-] as const;
+// [4, 3]
+const DOT_PHASE_BY_GRID_POSITION = [0, 1, 3, 2] as const;
 
 function toCssLength(size: string | number) {
   return typeof size === 'number' ? `${size}px` : size;
@@ -101,15 +99,11 @@ function ScriptStatusGlyph({ status }: { status: ScriptStatusKind }) {
 
     case 'in-progress':
       return (
-        <svg
-          className={cx(styles.icon, styles.inProgressIcon)}
-          viewBox="0 0 24 24"
-          aria-hidden="true"
-        >
-          {DOT_POINTS.map(([cx, cy], index) => (
-            <circle key={`${cx}-${cy}`} cx={cx} cy={cy} r="2" className={styles.dot[index]} />
+        <span className={cx(styles.dotGrid, styles.inProgressIcon)} aria-hidden="true">
+          {DOT_PHASE_BY_GRID_POSITION.map((phase, position) => (
+            <span key={position} data-dot="" className={styles.dot[phase]} />
           ))}
-        </svg>
+        </span>
       );
 
     case 'waiting':
