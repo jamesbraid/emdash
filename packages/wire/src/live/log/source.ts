@@ -14,9 +14,21 @@ type RetainedChunk = {
   bytes: number;
 };
 
+const LIVE_LOG_DEFAULT_COALESCE_MAX_BYTES = 64 * 1024;
+
 export type LiveLogSourceOptions = {
   maxBufferBytes?: number;
   generation?: number;
+  /**
+   * Batch appends into one emitted update per window of this many
+   * milliseconds. The retained text is always current; only subscriber
+   * notifications are delayed. A pty writing escape sequences produces
+   * hundreds of tiny appends a second, and every one otherwise becomes its
+   * own wire message through every hop to the renderer.
+   */
+  coalesceMs?: number;
+  /** Flush a coalescing source early once this much text is pending. */
+  coalesceMaxBytes?: number;
 };
 
 /**
@@ -29,15 +41,24 @@ export type LiveLogSourceOptions = {
 export class LiveLogSource {
   private readonly emitter = createEmitter<LiveUpdate>();
   private readonly maxBufferBytes: number;
+  private readonly coalesceMs: number | undefined;
+  private readonly coalesceMaxBytes: number;
   private generation: number;
   private sequence = 0;
   private baseOffset = 0;
   private bufferedBytes = 0;
   private truncated = false;
   private chunks: RetainedChunk[] = [];
+  private pending = '';
+  private pendingTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(options: LiveLogSourceOptions = {}) {
     this.maxBufferBytes = Math.max(0, options.maxBufferBytes ?? LIVE_LOG_DEFAULT_MAX_BUFFER_BYTES);
+    this.coalesceMs = options.coalesceMs;
+    this.coalesceMaxBytes = Math.max(
+      1,
+      options.coalesceMaxBytes ?? LIVE_LOG_DEFAULT_COALESCE_MAX_BYTES
+    );
     this.generation = options.generation ?? Date.now();
   }
 
@@ -49,19 +70,34 @@ export class LiveLogSource {
     this.bufferedBytes += retained.bytes;
     this.evictOldChunks();
 
-    const baseSequence = this.sequence;
-    this.sequence += 1;
-    const delta: LiveLogDelta = { chunk };
-    this.emitter.emit({
-      generation: this.generation,
-      baseSequence,
-      sequence: this.sequence,
-      timestamp: Date.now(),
-      delta,
-    });
+    if (this.coalesceMs === undefined) {
+      this.emitAppend(chunk);
+      return;
+    }
+    this.pending += chunk;
+    if (this.pending.length >= this.coalesceMaxBytes) {
+      this.flush();
+      return;
+    }
+    this.pendingTimer ??= setTimeout(() => this.flush(), this.coalesceMs);
+  }
+
+  /** Emits any coalesced text now. A no-op unless something is pending. */
+  flush(): void {
+    if (this.pendingTimer !== undefined) {
+      clearTimeout(this.pendingTimer);
+      this.pendingTimer = undefined;
+    }
+    if (this.pending.length === 0) return;
+    const chunk = this.pending;
+    this.pending = '';
+    this.emitAppend(chunk);
   }
 
   snapshot(): LiveSnapshot<LiveLogSnapshotData> {
+    // Subscribers must see the pending text before anyone seeds from a
+    // snapshot that already contains it, or the flush would apply twice.
+    this.flush();
     return {
       generation: this.generation,
       sequence: this.sequence,
@@ -75,6 +111,10 @@ export class LiveLogSource {
   }
 
   reseed(data?: LiveLogSnapshotData): void {
+    // Pending coalesced text was written under the generation that is ending.
+    // Emit it there now: dropping it would lose the last thing the old process
+    // wrote, and holding it would leak it into the new generation.
+    this.flush();
     this.generation = Math.max(this.generation + 1, Date.now());
     this.sequence = 0;
     this.baseOffset = data?.baseOffset ?? 0;
@@ -86,6 +126,19 @@ export class LiveLogSource {
 
   subscribe(cb: (update: LiveUpdate) => void): Unsubscribe {
     return this.emitter.subscribe(cb);
+  }
+
+  private emitAppend(chunk: string): void {
+    const baseSequence = this.sequence;
+    this.sequence += 1;
+    const delta: LiveLogDelta = { chunk };
+    this.emitter.emit({
+      generation: this.generation,
+      baseSequence,
+      sequence: this.sequence,
+      timestamp: Date.now(),
+      delta,
+    });
   }
 
   private evictOldChunks(): void {

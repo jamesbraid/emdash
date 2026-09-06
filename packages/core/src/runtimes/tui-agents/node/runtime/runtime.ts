@@ -45,6 +45,7 @@ import {
   logLocalPtySpawnWarnings,
   makeLegacyTmuxSessionName,
   makeTmuxSessionName,
+  PTY_OUTPUT_COALESCE_MS,
   PtyRegistry,
   resolveLocalPtySpawn,
   resolveTmuxSession,
@@ -785,7 +786,10 @@ export class TuiAgentsRuntime {
   private outputFor(conversationId: string): RetainedOutput {
     let log = this.logs.get(conversationId);
     if (!log) {
-      log = { source: new LiveLogSource(this.deps.log), subscribers: 0 };
+      log = {
+        source: new LiveLogSource({ coalesceMs: PTY_OUTPUT_COALESCE_MS, ...this.deps.log }),
+        subscribers: 0,
+      };
       this.logs.set(conversationId, log);
     }
     return log;
