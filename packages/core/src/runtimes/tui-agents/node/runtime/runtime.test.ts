@@ -16,7 +16,11 @@ import type {
 import type { ConversationLifecycleReporter } from '#services/conversation-reports/node';
 import { createRecordingConversationLifecycleReporter } from '#services/conversation-reports/node/testing';
 import type { IExecutionContext } from '#services/exec/api';
-import { makeLegacyTmuxSessionName, makeTmuxSessionName } from '#services/pty/api';
+import {
+  makeLegacyTmuxSessionName,
+  makeTmuxSessionName,
+  PTY_OUTPUT_COALESCE_MS,
+} from '#services/pty/api';
 import { FakePtySpawner } from '#services/pty/testing';
 import { createMemorySessionIntentStore } from '#services/session-intents/api';
 import {
@@ -248,6 +252,7 @@ describe('TuiAgentsRuntime', () => {
   });
 
   it('keeps an existing output subscriber connected after eviction and explicit resume', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
     const { runtime, spawner } = createRuntime();
     await runtime.startSession(startInput());
     const output = runtime.outputLog({ conversationId: 'conversation-1' });
@@ -258,6 +263,8 @@ describe('TuiAgentsRuntime', () => {
       await runtime.deactivateSession('conversation-1', 'workspace');
       await runtime.resumeSession(startInput({ sessionId: 'provider-session' }));
       spawner.processes[1]!.emitData('resumed output');
+      // Pty output reaches subscribers once per coalescing window.
+      await vi.advanceTimersByTimeAsync(PTY_OUTPUT_COALESCE_MS);
       expect(updates).toHaveBeenLastCalledWith(
         expect.objectContaining({
           delta: { chunk: 'resumed output' },
@@ -270,6 +277,7 @@ describe('TuiAgentsRuntime', () => {
     } finally {
       unsubscribe();
       await runtime.dispose();
+      vi.useRealTimers();
     }
   });
 
