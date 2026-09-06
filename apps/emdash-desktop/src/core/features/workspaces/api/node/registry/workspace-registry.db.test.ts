@@ -109,6 +109,64 @@ describe('WorkspaceRegistry', () => {
     });
   });
 
+  it('refreshing an unchanged path identity does not scan the host for path ownership', () => {
+    const registry = createWorkspaceRegistry(fixture.db);
+    registry.adopt({
+      id: 'ws',
+      type: 'local',
+      kind: 'repository',
+      location: 'local',
+      path: '/repo',
+    });
+    for (let i = 0; i < 5; i += 1) {
+      registry.adopt({
+        id: `other-${i}`,
+        type: 'local',
+        kind: 'worktree',
+        location: 'local',
+        path: `/repo/wt-${i}`,
+      });
+    }
+    const statements: string[] = [];
+    const prepare = fixture.sqlite.prepare.bind(fixture.sqlite);
+    fixture.sqlite.prepare = ((sql: string) => {
+      statements.push(sql);
+      return prepare(sql);
+    }) as typeof fixture.sqlite.prepare;
+
+    registry.refresh('ws', { path: '/repo', observedStatus: 'present', observedAt: 1 });
+
+    const workspaceReads = statements.filter(
+      (sql) => /^\s*select\b/i.test(sql) && sql.includes('"workspaces"')
+    );
+    // One primary-key read for the current row; no host-wide ownership scan.
+    expect(workspaceReads).toHaveLength(1);
+  });
+
+  it('refresh refuses moving onto a path owned by another live workspace', () => {
+    const registry = createWorkspaceRegistry(fixture.db);
+    registry.adopt({ id: 'a', type: 'local', kind: 'repository', location: 'local', path: '/a' });
+    registry.adopt({ id: 'b', type: 'local', kind: 'repository', location: 'local', path: '/b' });
+
+    expect(() => registry.refresh('b', { path: '/a', observedAt: 1 })).toThrow(/collision/);
+    expect(registry.getLive('b')?.path).toBe('/b');
+  });
+
+  it('refresh keeps the stored spelling for a respelled path with the same identity', () => {
+    const registry = createWorkspaceRegistry(fixture.db);
+    registry.adopt({
+      id: 'ws',
+      type: 'local',
+      kind: 'repository',
+      location: 'local',
+      path: '/repo',
+    });
+
+    registry.refresh('ws', { path: '/repo/../repo', observedAt: 1 });
+
+    expect(registry.getLive('ws')?.path).toBe('/repo');
+  });
+
   it('claims a Host record and explicitly retracks the same canonical id', () => {
     const registry = createWorkspaceRegistry(fixture.db);
     const config = {
