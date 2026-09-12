@@ -357,6 +357,7 @@ describe('createWorkspaceRegistryWireController', () => {
       expect(applied).toEqual({
         adopted: 0,
         refreshed: 0,
+        unchanged: 0,
         markedMissing: 0,
         untracked: 0,
         purgedTombstones: 0,

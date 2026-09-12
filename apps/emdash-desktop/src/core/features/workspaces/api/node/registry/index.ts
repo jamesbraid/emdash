@@ -2,6 +2,7 @@ export {
   createWorkspaceRegistry,
   isAnnotatedWorkspace,
   liveWorkspaces,
+  observationMatchesRow,
   WorkspaceRegistry,
   workspaceObservationFromRecord,
   workspaceRegistryTable,

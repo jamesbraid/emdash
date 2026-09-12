@@ -1,5 +1,5 @@
 import type { WorkspaceRecord } from '@emdash/core/runtimes/workspace-registry/api';
-import { err, ok, type Result } from '@emdash/shared';
+import { err, isDeepEqual, ok, type Result } from '@emdash/shared';
 import { and, eq, inArray, isNull, type SQL } from 'drizzle-orm';
 import {
   tombstoneAttemptEpoch,
@@ -282,6 +282,21 @@ export class WorkspaceRegistry {
       .run().changes;
   }
 
+  /**
+   * Re-stamps rows whose delivered observation already matches the mirror (see
+   * `observationMatchesRow`): only the observation timestamp moves. One statement for
+   * the whole batch, so an unchanged host snapshot costs a constant number of writes
+   * regardless of its size.
+   */
+  stampObserved(ids: readonly string[], observedAt: number, tx?: DrizzleTx): number {
+    if (ids.length === 0) return 0;
+    return this.source(tx)
+      .update(workspaces)
+      .set({ observedAt, updatedAt: this.now() })
+      .where(and(inArray(workspaces.id, [...ids]), liveWorkspaces()))
+      .run().changes;
+  }
+
   updateConfig(id: string, config: WorkspaceInsert['config'], tx?: DrizzleTx): number {
     return this.source(tx)
       .update(workspaces)
@@ -455,6 +470,28 @@ export function workspaceObservationFromRecord(
     location: host.location,
     sshConnectionId: host.sshConnectionId,
   };
+}
+
+/**
+ * True when `refresh(row.id, observation)` would change nothing but the timestamp:
+ * every delivered column already holds the stored value, and the delivered path is at
+ * most a respelling that `stableWorkspacePathDisplay` keeps as stored.
+ */
+export function observationMatchesRow(
+  row: WorkspaceRow,
+  observation: WorkspaceObservation
+): boolean {
+  const { path, observedAt: _observedAt, ...observed } = observation;
+  if (path !== undefined) {
+    const persisted =
+      path !== null && row.path !== null ? stableWorkspacePathDisplay(row.path, path) : path;
+    if (persisted !== row.path) return false;
+  }
+  for (const key of Object.keys(observed) as (keyof typeof observed)[]) {
+    const value = observed[key];
+    if (value !== undefined && !isDeepEqual(value, row[key])) return false;
+  }
+  return true;
 }
 
 function sameWorkspaceHost(
