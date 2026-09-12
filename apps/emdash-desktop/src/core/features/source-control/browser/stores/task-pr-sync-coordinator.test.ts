@@ -1,14 +1,24 @@
+import { ok } from '@emdash/shared';
+import { cell, expose } from '@emdash/wire/state';
+import { createTestWire } from '@emdash/wire/testing';
 import { observable, runInAction } from 'mobx';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { GitRepositoryStore } from '@core/features/source-control/api/browser/stores/git-repository-store';
 import { getTaskPrAssociationStore } from '@core/features/source-control/api/browser/stores/task-source-control-selectors';
 import type { TaskManagerStore } from '@core/features/tasks/api/browser/stores/task-manager';
-import { createUnprovisionedTask } from '@core/features/tasks/api/browser/stores/task-store';
-import type { Task } from '@core/primitives/tasks/api';
+import {
+  createUnprovisionedTask,
+  type TaskStore,
+} from '@core/features/tasks/api/browser/stores/task-store';
+import type { Task, WorkspaceObservedPrFacts } from '@core/primitives/tasks/api';
+import { pullRequestsContract, type SyncState } from '@core/services/pull-requests/api';
+import type { PullRequestsRuntimeClient } from '@core/services/pull-requests/api/client';
 import { TaskPrSyncCoordinator } from './task-pr-sync-coordinator';
 
 const mocks = vi.hoisted(() => ({
-  getPullRequestsRuntimeClient: vi.fn(() => new Promise<never>(() => {})),
+  getPullRequestsRuntimeClient: vi.fn<() => Promise<PullRequestsRuntimeClient>>(
+    () => new Promise<never>(() => {})
+  ),
 }));
 
 vi.mock('@core/manifests/browser/task-persistent-stores', async () => {
@@ -30,11 +40,13 @@ vi.mock('@core/services/pull-requests/api/client', () => ({
 }));
 
 const coordinators: TaskPrSyncCoordinator[] = [];
+const cleanups: (() => Promise<void>)[] = [];
 
-afterEach(() => {
+afterEach(async () => {
   for (const coordinator of coordinators) coordinator.dispose();
   coordinators.length = 0;
-  mocks.getPullRequestsRuntimeClient.mockClear();
+  for (const cleanup of cleanups.splice(0)) await cleanup();
+  mocks.getPullRequestsRuntimeClient.mockReset();
 });
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -60,10 +72,19 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   };
 }
 
-function makeTasks(task: Task): TaskManagerStore {
-  const store = createUnprovisionedTask(task);
-  getTaskPrAssociationStore(store).setAssociation(task.prs, { kind: 'unknown' });
-  return { tasks: observable.map([[task.id, store]]) } as unknown as TaskManagerStore;
+function makeTasks(...taskList: Task[]): TaskManagerStore {
+  const stores = taskList.map((task) => {
+    const store = createUnprovisionedTask(task);
+    getTaskPrAssociationStore(store).setAssociation(task.prs, { kind: 'unknown' });
+    return [task.id, store] as const;
+  });
+  return { tasks: observable.map(stores) } as unknown as TaskManagerStore;
+}
+
+function taskStore(tasks: TaskManagerStore, taskId: string): TaskStore {
+  const store = tasks.tasks.get(taskId);
+  if (!store) throw new Error(`Missing task ${taskId}`);
+  return store;
 }
 
 function prs(tasks: TaskManagerStore, taskId: string): readonly Task['prs'][number][] | undefined {
@@ -305,5 +326,114 @@ describe('TaskPrSyncCoordinator association preservation', () => {
     });
 
     expect(prs(tasks, task.id)).toHaveLength(1);
+  });
+});
+
+const repositoryUrl = 'https://github.com/emdash/emdash';
+
+function makeAvailableRepository(): GitRepositoryStore {
+  return makeRepository({
+    repositoryUrl,
+    observation: {
+      kind: 'fresh',
+      value: {
+        success: true,
+        data: {
+          provider: 'github',
+          host: 'github.com',
+          repositoryUrl,
+          nameWithOwner: 'emdash/emdash',
+          capabilities: { pullRequests: true, issues: true },
+        },
+      },
+      observedAt: 1,
+    },
+  });
+}
+
+/** An in-process PR runtime whose cache lookups are spies and whose sync state never moves. */
+function makePullRequestsWire() {
+  const getPullRequestsForHead = vi.fn(
+    async (_input: Parameters<PullRequestsRuntimeClient['getPullRequestsForHead']>[0]) =>
+      ok({ prs: [] })
+  );
+  const getPullRequestByUrl = vi.fn(
+    async (_input: Parameters<PullRequestsRuntimeClient['getPullRequestByUrl']>[0]) =>
+      ok({ pr: null })
+  );
+  const syncState = expose(pullRequestsContract.syncState, {
+    state: () => cell<SyncState>({ phase: 'idle', kind: null }),
+  });
+  const wire = createTestWire(pullRequestsContract, {
+    getPullRequestsForHead,
+    getPullRequestByUrl,
+    syncState,
+  });
+  cleanups.push(
+    () => wire.dispose(),
+    () => syncState.dispose()
+  );
+  mocks.getPullRequestsRuntimeClient.mockResolvedValue(wire.client);
+  return { getPullRequestsForHead, getPullRequestByUrl };
+}
+
+function observedFacts(
+  branch: string,
+  overrides: Partial<WorkspaceObservedPrFacts> = {}
+): WorkspaceObservedPrFacts {
+  return {
+    branch,
+    prBreadcrumb: null,
+    upstream: { mergeRef: `refs/heads/${branch}`, remoteUrl: repositoryUrl },
+    headOid: '1'.repeat(40),
+    ahead: 0,
+    behind: 0,
+    ...overrides,
+  };
+}
+
+/** A registry delivery: the store receives a freshly built facts object every time. */
+function project(store: TaskStore, observedPr: WorkspaceObservedPrFacts): void {
+  store.setWorkspaceProjection({ path: null, observedStatus: 'present', observedPr });
+}
+
+function settle(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 20));
+}
+
+describe('TaskPrSyncCoordinator reload scoping', () => {
+  async function startTwoTasks() {
+    const client = makePullRequestsWire();
+    const tasks = makeTasks(makeTask(), makeTask({ id: 'task-2', workspaceId: 'workspace-2' }));
+    project(taskStore(tasks, 'task-1'), observedFacts('feature-1'));
+    project(taskStore(tasks, 'task-2'), observedFacts('feature-2'));
+    start(tasks, makeAvailableRepository());
+    await vi.waitFor(() => expect(client.getPullRequestsForHead).toHaveBeenCalledTimes(2));
+    client.getPullRequestsForHead.mockClear();
+    return { ...client, tasks };
+  }
+
+  it('skips cache lookups when identical observed facts are re-projected', async () => {
+    const { tasks, getPullRequestsForHead, getPullRequestByUrl } = await startTwoTasks();
+
+    for (let i = 0; i < 5; i++) {
+      project(taskStore(tasks, 'task-1'), observedFacts('feature-1'));
+      project(taskStore(tasks, 'task-2'), observedFacts('feature-2'));
+    }
+    await settle();
+
+    expect(getPullRequestsForHead).not.toHaveBeenCalled();
+    expect(getPullRequestByUrl).not.toHaveBeenCalled();
+  });
+
+  it('reloads only the task whose observed head moved', async () => {
+    const { tasks, getPullRequestsForHead } = await startTwoTasks();
+
+    project(taskStore(tasks, 'task-2'), observedFacts('feature-2', { headOid: '2'.repeat(40) }));
+    await vi.waitFor(() => expect(getPullRequestsForHead).toHaveBeenCalledTimes(1));
+    await settle();
+
+    expect(getPullRequestsForHead).toHaveBeenCalledTimes(1);
+    expect(getPullRequestsForHead.mock.calls[0]?.[0]).toMatchObject({ headRefName: 'feature-2' });
   });
 });
