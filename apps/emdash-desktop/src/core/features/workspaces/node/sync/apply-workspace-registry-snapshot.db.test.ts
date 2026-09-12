@@ -6,6 +6,7 @@ import { openFixture } from '@tooling/utils/db';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   createWorkspaceRegistry,
+  workspaceObservationFromRecord,
   workspaceRegistryTable,
 } from '@core/features/workspaces/api/node/registry';
 import { appDbPokes, type WorkspacePoke } from '@core/services/app-db/node/pokes';
@@ -699,10 +700,11 @@ describe('applyWorkspaceRegistrySnapshot', () => {
       await apply(records, stamp(1));
       const before = liveRows();
       const base = hostRecord({ id: 'wt-2' });
-      const changed: WorkspaceRecords = {
-        ...records,
-        'wt-2': { ...base, git: base.git === null ? null : { ...base.git, dirty: false } },
+      const changedRecord: WorkspaceRecord = {
+        ...base,
+        git: base.git === null ? null : { ...base.git, dirty: false },
       };
+      const changed: WorkspaceRecords = { ...records, 'wt-2': changedRecord };
 
       const { result, statements } = await statementsDuring(() => apply(changed, stamp(2)));
 
@@ -714,9 +716,19 @@ describe('applyWorkspaceRegistrySnapshot', () => {
         untracked: 0,
         purgedTombstones: 0,
       });
-      // Only the changed row pays for refresh's path checks and its own write, plus the
-      // two lookups that map changed rows to the projects to poke.
-      expect(statements).toEqual({ SELECT: 8, UPDATE: 2 });
+      // On top of the identical-redelivery reads (host rows, the two annotation lookups,
+      // tombstones) the changed row pays for refresh's own reads and its write, plus the
+      // two lookups that map changed rows to the projects to poke. Refresh's read count
+      // is measured directly so this holds whatever refresh needs to check.
+      const registry = createWorkspaceRegistry(fixture.db);
+      const { statements: refreshStatements } = await statementsDuring(async () => {
+        registry.refresh(
+          'wt-2',
+          workspaceObservationFromRecord(changedRecord, LOCAL_HOST, stamp(2))
+        );
+      });
+      expect(refreshStatements['UPDATE']).toBe(1);
+      expect(statements).toEqual({ SELECT: 4 + (refreshStatements['SELECT'] ?? 0) + 2, UPDATE: 2 });
       const after = liveRows();
       expect(after.find((row) => row.id === 'wt-2')?.observedGit).toMatchObject({ dirty: false });
       const others = (rows: WorkspaceRow[]) =>
