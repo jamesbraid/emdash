@@ -37,3 +37,39 @@ export function loadWorkspaceAnnotations(
     ),
   };
 }
+
+export type AffectedWorkspaceRows = {
+  workspaceIds: ReadonlySet<string>;
+  /** Parent repository ids of those rows: a repository's children list under its project. */
+  parentIds: ReadonlySet<string>;
+};
+
+/**
+ * Every project whose views include one of these rows: projects with a task on the
+ * row, and projects whose repository workspace is the row or its parent (the
+ * workspace groups read lists a repository's children as candidates).
+ */
+export function loadWorkspaceProjectIds(
+  db: AppDb | DrizzleTx,
+  rows: AffectedWorkspaceRows
+): Set<string> {
+  const projectIds = new Set<string>();
+  if (rows.workspaceIds.size > 0) {
+    const taskRows = db
+      .select({ projectId: tasks.projectId })
+      .from(tasks)
+      .where(inArray(tasks.workspaceId, [...rows.workspaceIds]))
+      .all();
+    for (const row of taskRows) projectIds.add(row.projectId);
+  }
+  const repositoryIds = [...new Set([...rows.workspaceIds, ...rows.parentIds])];
+  if (repositoryIds.length > 0) {
+    const projectRows = db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(inArray(projects.repositoryWorkspaceId, repositoryIds))
+      .all();
+    for (const row of projectRows) projectIds.add(row.id);
+  }
+  return projectIds;
+}

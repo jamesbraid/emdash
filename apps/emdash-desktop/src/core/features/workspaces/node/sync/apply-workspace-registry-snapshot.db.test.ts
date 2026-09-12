@@ -8,6 +8,7 @@ import {
   createWorkspaceRegistry,
   workspaceRegistryTable,
 } from '@core/features/workspaces/api/node/registry';
+import { appDbPokes, type WorkspacePoke } from '@core/services/app-db/node/pokes';
 import type { WorkspaceRow } from '@core/services/app-db/node/schema';
 import {
   applyWorkspaceRegistrySnapshot,
@@ -713,8 +714,9 @@ describe('applyWorkspaceRegistrySnapshot', () => {
         untracked: 0,
         purgedTombstones: 0,
       });
-      // Only the changed row pays for refresh's path checks and its own write.
-      expect(statements).toEqual({ SELECT: 6, UPDATE: 2 });
+      // Only the changed row pays for refresh's path checks and its own write, plus the
+      // two lookups that map changed rows to the projects to poke.
+      expect(statements).toEqual({ SELECT: 8, UPDATE: 2 });
       const after = liveRows();
       expect(after.find((row) => row.id === 'wt-2')?.observedGit).toMatchObject({ dirty: false });
       const others = (rows: WorkspaceRow[]) =>
@@ -747,6 +749,87 @@ describe('applyWorkspaceRegistrySnapshot', () => {
 
       expect(again).toMatchObject({ refreshed: 0, unchanged: 1 });
       expect(registry.getLive('ws-repo')).toMatchObject({ path: 'C:\\Repo', observedAt: stamp(2) });
+    });
+  });
+
+  /**
+   * Live models key on projectId (`matchProject`): a poke without one refetches every
+   * project. Each delivery pokes exactly the projects it changed, and a delivery that
+   * only moved observation stamps pokes nobody.
+   */
+  describe('pokes', () => {
+    function seedProject(projectId: string, repositoryWorkspaceId: string): void {
+      fixture.sqlite
+        .prepare(`INSERT INTO projects (id, name, repository_workspace_id) VALUES (?, ?, ?)`)
+        .run(projectId, `project-${projectId}`, repositoryWorkspaceId);
+    }
+
+    function apply(records: WorkspaceRecords, observedAt: number) {
+      return applyWorkspaceRegistrySnapshot({
+        db: fixture.db,
+        host: LOCAL_HOST,
+        records,
+        observedAt,
+      });
+    }
+
+    async function pokesDuring(run: () => Promise<unknown>): Promise<WorkspacePoke[]> {
+      const poke = vi.spyOn(appDbPokes.workspaces, 'poke');
+      try {
+        await run();
+        return poke.mock.calls
+          .map(([payload]) => payload)
+          .sort((left, right) => (left.projectId ?? '').localeCompare(right.projectId ?? ''));
+      } finally {
+        poke.mockRestore();
+      }
+    }
+
+    it('pokes each project the delivery changed and nobody for a stamp-only delivery', async () => {
+      seedProject('project-a', 'repo-a');
+      seedTask('project-b', 'task-b', 'wt-b');
+      const records: WorkspaceRecords = {
+        'repo-a': hostRecord({
+          id: 'repo-a',
+          kind: 'repository',
+          path: '/repos/a',
+          parentId: null,
+          gitAdminName: null,
+        }),
+        // A repository's child lists under its project without any task link.
+        'wt-a': hostRecord({ id: 'wt-a', parentId: 'repo-a' }),
+        'wt-b': hostRecord({ id: 'wt-b' }),
+        // Neither a project repository, its child, nor a task workspace: no view lists it.
+        'wt-stray': hostRecord({ id: 'wt-stray', parentId: null }),
+      };
+
+      expect(await pokesDuring(() => apply(records, stamp(1)))).toEqual([
+        { projectId: 'project-a' },
+        { projectId: 'project-b' },
+      ]);
+      expect(await pokesDuring(() => apply(records, stamp(2)))).toEqual([]);
+
+      const wtA = hostRecord({ id: 'wt-a', parentId: 'repo-a' });
+      const changedChild: WorkspaceRecords = {
+        ...records,
+        'wt-a': { ...wtA, git: wtA.git === null ? null : { ...wtA.git, dirty: false } },
+      };
+      expect(await pokesDuring(() => apply(changedChild, stamp(3)))).toEqual([
+        { projectId: 'project-a' },
+      ]);
+
+      const changedStray: WorkspaceRecords = {
+        ...changedChild,
+        'wt-stray': hostRecord({ id: 'wt-stray', parentId: null, lastActivatedAt: stamp(4) }),
+      };
+      expect(await pokesDuring(() => apply(changedStray, stamp(4)))).toEqual([]);
+
+      // Losing the task's record marks it missing for that project; still missing is quiet.
+      const { 'wt-b': _dropped, ...withoutTaskRow } = changedStray;
+      expect(await pokesDuring(() => apply(withoutTaskRow, stamp(5)))).toEqual([
+        { projectId: 'project-b' },
+      ]);
+      expect(await pokesDuring(() => apply(withoutTaskRow, stamp(6)))).toEqual([]);
     });
   });
 });

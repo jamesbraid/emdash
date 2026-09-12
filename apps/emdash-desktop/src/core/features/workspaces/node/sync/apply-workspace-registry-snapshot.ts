@@ -14,7 +14,7 @@ import { workspacePathIdentityKey } from '@core/features/workspaces/api/workspac
 import type { AppDb, DrizzleTx } from '@core/services/app-db/node/db';
 import { appDbPokes } from '@core/services/app-db/node/pokes';
 import { type WorkspaceRow } from '@core/services/app-db/node/schema';
-import { loadWorkspaceAnnotations } from './workspace-annotations';
+import { loadWorkspaceAnnotations, loadWorkspaceProjectIds } from './workspace-annotations';
 
 export interface ApplyWorkspaceRegistrySnapshotInput {
   db: AppDb;
@@ -75,11 +75,15 @@ export async function applyWorkspaceRegistrySnapshot(
 ): Promise<ApplyWorkspaceRegistrySnapshotResult> {
   const now = new Date().toISOString();
   const registry = createWorkspaceRegistry(input.db, { now: () => now });
-  const result = input.db.transaction((tx) =>
+  const { counts, affectedProjectIds } = input.db.transaction((tx) =>
     applyWorkspaceRegistrySnapshotTx(tx, input, registry, now)
   );
-  appDbPokes.workspaces.poke({});
-  return result;
+  // Live models key on projectId (`matchProject`), and a poke without one refetches
+  // every project. Poke exactly the projects whose rows changed. A delivery that only
+  // moved observation stamps pokes nobody: observedAt is display-only, and fresh/stale
+  // state comes from host attachment, not from the stamp.
+  for (const projectId of affectedProjectIds) appDbPokes.workspaces.poke({ projectId });
+  return counts;
 }
 
 function applyWorkspaceRegistrySnapshotTx(
@@ -87,7 +91,7 @@ function applyWorkspaceRegistrySnapshotTx(
   input: ApplyWorkspaceRegistrySnapshotInput,
   registry: WorkspaceRegistry,
   now: string
-): ApplyWorkspaceRegistrySnapshotResult {
+): { counts: ApplyWorkspaceRegistrySnapshotResult; affectedProjectIds: Set<string> } {
   const observedAt = input.observedAt ?? Date.now();
   const hostRows = loadLiveHostRows(tx, input.host);
   const hostRowsById = new Map(hostRows.map((row) => [row.id, row]));
@@ -112,6 +116,13 @@ function applyWorkspaceRegistrySnapshotTx(
   );
   const seen = new Set<string>();
   const unchangedIds: string[] = [];
+  // Rows this delivery changed, with the repositories they hang off, so the projects
+  // whose views include them can be poked once the transaction commits.
+  const affected = { workspaceIds: new Set<string>(), parentIds: new Set<string>() };
+  const touch = (id: string, ...parentIds: (string | null)[]): void => {
+    affected.workspaceIds.add(id);
+    for (const parentId of parentIds) if (parentId !== null) affected.parentIds.add(parentId);
+  };
   for (const record of Object.values(input.records)) {
     seen.add(record.id);
     // Desktop untracking is durable: a delivery never resurrects a tombstoned row.
@@ -133,6 +144,7 @@ function applyWorkspaceRegistrySnapshotTx(
         tx
       );
       counts.adopted += 1;
+      touch(record.id, record.parentId);
       continue;
     }
     // The host re-delivers its full map on every change; most rows in it are the
@@ -143,6 +155,7 @@ function applyWorkspaceRegistrySnapshotTx(
     }
     registry.refresh(record.id, observation, tx);
     counts.refreshed += 1;
+    touch(record.id, record.parentId, existing.parentId);
   }
 
   for (const row of hostRows) {
@@ -154,6 +167,7 @@ function applyWorkspaceRegistrySnapshotTx(
     if (row.deletionTombstone !== null) {
       registry.untrack([row.id], now, undefined, tx);
       counts.purgedTombstones += 1;
+      touch(row.id, row.parentId);
       continue;
     }
     const annotated = isAnnotatedWorkspace({
@@ -169,17 +183,19 @@ function applyWorkspaceRegistrySnapshotTx(
       } else {
         registry.refresh(row.id, { observedStatus: 'missing', observedAt }, tx);
         counts.markedMissing += 1;
+        touch(row.id, row.parentId);
       }
     } else {
       // Pure mirror entries follow the mirror.
       registry.untrack([row.id], now, undefined, tx);
       counts.untracked += 1;
+      touch(row.id, row.parentId);
     }
   }
 
   registry.stampObserved(unchangedIds, observedAt, tx);
   counts.unchanged = unchangedIds.length;
-  return counts;
+  return { counts, affectedProjectIds: loadWorkspaceProjectIds(tx, affected) };
 }
 
 /**
