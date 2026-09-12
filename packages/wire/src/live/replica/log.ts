@@ -31,7 +31,10 @@ export class ReplicaLog implements LiveSource {
   private local: LiveLogSource | undefined;
   private readonly client: LiveLogClient;
   private readonly appendEmitter = createEmitter<string>();
-  private readonly detachPromise: Promise<Unsubscribe>;
+  /** The transport subscription; null while parked and after dispose. */
+  private attachment: Promise<Unsubscribe> | null = null;
+  /** Detaches still in flight, so dispose resolves only once they land. */
+  private releasing: Promise<void> = Promise.resolve();
   private writtenOffset = 0;
   private disposed = false;
 
@@ -49,9 +52,7 @@ export class ReplicaLog implements LiveSource {
       topic: handle.topic,
     });
     this.ready = handle.snapshot().then((snapshot) => this.client.seed(snapshot));
-    this.detachPromise = handle.attach((update) => this.client.applyUpdate(update), {
-      onReattach: () => this.client.invalidate(),
-    });
+    this.attachment = this.attach();
   }
 
   text(): string {
@@ -74,12 +75,58 @@ export class ReplicaLog implements LiveSource {
     return this.localSource().subscribe(cb);
   }
 
+  /**
+   * Releases the transport subscription while keeping the materialized log and
+   * its offsets, so `resume()` can pick up where the stream left off instead of
+   * replaying the retained tail. Idempotent; resolves once the transport has
+   * detached, and is a no-op after dispose.
+   */
+  park(): Promise<void> {
+    const attachment = this.attachment;
+    if (attachment) {
+      this.attachment = null;
+      // A subscription that never established has nothing to release.
+      const release = attachment.then(
+        (detach) => detach(),
+        () => {}
+      );
+      this.releasing = this.releasing.then(() => release);
+    }
+    return this.releasing;
+  }
+
+  /**
+   * Re-attaches after `park()` and refetches the snapshot: the materializer
+   * appends only the bytes missed while parked when the source still retains
+   * them, and resets to the retained tail otherwise. Idempotent; a park or
+   * dispose racing the attach wins.
+   */
+  async resume(): Promise<void> {
+    if (this.disposed || this.attachment) return;
+    const attachment = this.attach();
+    this.attachment = attachment;
+    try {
+      await attachment;
+    } catch (error) {
+      if (this.attachment === attachment) this.attachment = null;
+      throw error;
+    }
+    if (this.attachment !== attachment) return;
+    this.client.invalidate();
+  }
+
   async dispose(): Promise<void> {
     if (this.disposed) return;
     this.disposed = true;
     this.client.dispose();
     this.appendEmitter.clear();
-    (await this.detachPromise)();
+    await this.park();
+  }
+
+  private attach(): Promise<Unsubscribe> {
+    return this.handle.attach((update) => this.client.applyUpdate(update), {
+      onReattach: () => this.client.invalidate(),
+    });
   }
 
   private reset(data: LiveLogSnapshotData): void {
