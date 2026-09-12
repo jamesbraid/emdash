@@ -1,7 +1,7 @@
 import { isDeepEqual } from '@emdash/shared';
 import { createScope, type Scope } from '@emdash/shared/concurrency';
 import { observe, remote, type RemoteModel } from '@emdash/wire/state';
-import { reaction, toJS } from 'mobx';
+import { comparer, reaction, toJS } from 'mobx';
 import type { GitRepositoryStore } from '@core/features/source-control/api/browser/stores/git-repository-store';
 import { getTaskPrAssociationStore } from '@core/features/source-control/api/browser/stores/task-source-control-selectors';
 import { gitCheckoutStoreToken } from '@core/features/source-control/contributions/browser/workspace-store-tokens';
@@ -36,30 +36,25 @@ export class TaskPrSyncCoordinator {
     // association facts (breadcrumb, upstream, branch) and fallback git facts —
     // observation changes must re-derive even when the local checkout never moved
     // (e.g. the host scan delivers a breadcrumb or sees the follow move the head).
+    // Compared structurally: every registry delivery re-projects the observed facts
+    // as fresh objects, so an identity comparison would reload on each one. Only
+    // tasks whose fingerprint moved (or that are new) reload.
     this.disposeGitHeadReaction = reaction(
-      () =>
-        [...tasks.tasks.values()].filter(isRegistered).map((store) => {
-          const git = getTaskGitCheckoutStore(store);
-          const checkout = git?.headTrackingSnapshot;
-          const observed = store.workspaceObservedPr;
-          return [
-            store.workspaceId,
-            (store.data as Task).workspaceId ?? '',
-            store.workspaceObservedStatus ?? '',
-            git?.branchName ?? '',
-            checkout?.headOid ?? '',
-            checkout?.ahead ?? '',
-            checkout?.behind ?? '',
-            observed?.branch ?? '',
-            observed?.prBreadcrumb ?? '',
-            observed?.upstream?.mergeRef ?? '',
-            observed?.upstream?.remoteUrl ?? '',
-            observed?.headOid ?? '',
-            observed?.ahead ?? '',
-            observed?.behind ?? '',
-          ].join(':');
-        }),
-      () => this.reloadAll()
+      () => {
+        const fingerprints = new Map<string, string>();
+        for (const [taskId, store] of tasks.tasks) {
+          if (isRegistered(store)) fingerprints.set(taskId, associationFingerprint(store));
+        }
+        return fingerprints;
+      },
+      (fingerprints, previous) => {
+        for (const [taskId, fingerprint] of fingerprints) {
+          if (previous.get(taskId) === fingerprint) continue;
+          const store = tasks.tasks.get(taskId);
+          if (store) void this.reloadTask(store);
+        }
+      },
+      { equals: comparer.structural }
     );
     this.disposeRepositoryReaction = reaction(
       () => [repository.pullRequestRepositoryUrl, repository.canonicalPushRepositoryUrl] as const,
@@ -188,6 +183,29 @@ function getTaskGitCheckoutStore(store: TaskStore) {
 
 function isRegistered(store: TaskStore): boolean {
   return store.state !== 'unregistered';
+}
+
+/** Every input `reloadTask` derives from, joined so equal facts compare equal. */
+function associationFingerprint(store: TaskStore): string {
+  const git = getTaskGitCheckoutStore(store);
+  const checkout = git?.headTrackingSnapshot;
+  const observed = store.workspaceObservedPr;
+  return [
+    store.workspaceId,
+    (store.data as Task).workspaceId ?? '',
+    store.workspaceObservedStatus ?? '',
+    git?.branchName ?? '',
+    checkout?.headOid ?? '',
+    checkout?.ahead ?? '',
+    checkout?.behind ?? '',
+    observed?.branch ?? '',
+    observed?.prBreadcrumb ?? '',
+    observed?.upstream?.mergeRef ?? '',
+    observed?.upstream?.remoteUrl ?? '',
+    observed?.headOid ?? '',
+    observed?.ahead ?? '',
+    observed?.behind ?? '',
+  ].join(':');
 }
 
 type AssociationInputs = {
