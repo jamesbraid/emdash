@@ -4,6 +4,7 @@ import {
   createWorkspaceRegistry,
   isAnnotatedWorkspace,
   liveWorkspaces,
+  observationMatchesRow,
   workspaceObservationFromRecord,
   workspaceRegistryTable as workspaces,
   type WorkspaceHostIdentity,
@@ -25,7 +26,10 @@ export interface ApplyWorkspaceRegistrySnapshotInput {
 
 export interface ApplyWorkspaceRegistrySnapshotResult {
   adopted: number;
+  /** Rows whose delivered observation differed from the mirror and were rewritten. */
   refreshed: number;
+  /** Rows the delivery matched exactly; only their observation timestamp moved. */
+  unchanged: number;
   markedMissing: number;
   untracked: number;
   /** Tombstoned rows whose host record this delivery confirmed gone (ADR 0006). */
@@ -62,8 +66,9 @@ export class WorkspaceIdentityConflictError extends Error {
  * `records` delivery applies as a single idempotent transaction through the registry
  * sole-writer verbs — refresh matches by id, adopt unknowns, sweep unmatched rows
  * through the missing rules. Observations (the git block, create outcome, runtime
- * overlay included) overwrite wholesale; annotations are never touched. Callers must
- * only invoke this after a successful read: an unreachable host sweeps nothing.
+ * overlay included) overwrite wholesale where they differ — a row the delivery matches
+ * exactly only has its observation stamp moved; annotations are never touched. Callers
+ * must only invoke this after a successful read: an unreachable host sweeps nothing.
  */
 export async function applyWorkspaceRegistrySnapshot(
   input: ApplyWorkspaceRegistrySnapshotInput
@@ -85,6 +90,7 @@ function applyWorkspaceRegistrySnapshotTx(
 ): ApplyWorkspaceRegistrySnapshotResult {
   const observedAt = input.observedAt ?? Date.now();
   const hostRows = loadLiveHostRows(tx, input.host);
+  const hostRowsById = new Map(hostRows.map((row) => [row.id, row]));
   const annotations = loadWorkspaceAnnotations(
     tx,
     hostRows.map((row) => row.id)
@@ -94,6 +100,7 @@ function applyWorkspaceRegistrySnapshotTx(
   const counts: ApplyWorkspaceRegistrySnapshotResult = {
     adopted: 0,
     refreshed: 0,
+    unchanged: 0,
     markedMissing: 0,
     untracked: 0,
     purgedTombstones: 0,
@@ -104,19 +111,23 @@ function applyWorkspaceRegistrySnapshotTx(
     Object.values(input.records).map((record) => record.id)
   );
   const seen = new Set<string>();
+  const unchangedIds: string[] = [];
   for (const record of Object.values(input.records)) {
     seen.add(record.id);
     // Desktop untracking is durable: a delivery never resurrects a tombstoned row.
     if (tombstoned.has(record.id)) continue;
     // Matching is a primary-key lookup on the preserved workspace UUID — the host
-    // already resolved moves and adoptions; no path or admin-name matching here.
-    const existing = registry.getLive(record.id, tx);
+    // already resolved moves and adoptions; no path or admin-name matching here. The
+    // host's rows are already loaded; only an id absent from them costs a read (a live
+    // row under another host refreshes rather than re-inserting).
+    const existing = hostRowsById.get(record.id) ?? registry.getLive(record.id, tx);
+    const observation = workspaceObservationFromRecord(record, input.host, observedAt);
     if (existing === undefined) {
       registry.adopt(
         {
           id: record.id,
           type: input.host.location === 'remote' ? 'project-ssh' : 'local',
-          ...workspaceObservationFromRecord(record, input.host, observedAt),
+          ...observation,
           createdAt: new Date(record.createdAt).toISOString(),
         },
         tx
@@ -124,7 +135,13 @@ function applyWorkspaceRegistrySnapshotTx(
       counts.adopted += 1;
       continue;
     }
-    registry.refresh(record.id, workspaceObservationFromRecord(record, input.host, observedAt), tx);
+    // The host re-delivers its full map on every change; most rows in it are the
+    // same as last time. Those only get their stamp moved, in one batch below.
+    if (observationMatchesRow(existing, observation)) {
+      unchangedIds.push(record.id);
+      continue;
+    }
+    registry.refresh(record.id, observation, tx);
     counts.refreshed += 1;
   }
 
@@ -145,9 +162,14 @@ function applyWorkspaceRegistrySnapshotTx(
       isProjectRepository: annotations.projectRepositoryWorkspaceIds.has(row.id),
     });
     if (annotated) {
-      // Annotated rows stay visible as missing until the user acts.
-      registry.refresh(row.id, { observedStatus: 'missing', observedAt }, tx);
-      counts.markedMissing += 1;
+      // Annotated rows stay visible as missing until the user acts; one already
+      // marked only has its stamp moved.
+      if (row.observedStatus === 'missing') {
+        unchangedIds.push(row.id);
+      } else {
+        registry.refresh(row.id, { observedStatus: 'missing', observedAt }, tx);
+        counts.markedMissing += 1;
+      }
     } else {
       // Pure mirror entries follow the mirror.
       registry.untrack([row.id], now, undefined, tx);
@@ -155,6 +177,8 @@ function applyWorkspaceRegistrySnapshotTx(
     }
   }
 
+  registry.stampObserved(unchangedIds, observedAt, tx);
+  counts.unchanged = unchangedIds.length;
   return counts;
 }
 
