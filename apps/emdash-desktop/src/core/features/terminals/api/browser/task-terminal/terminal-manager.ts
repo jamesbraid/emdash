@@ -312,14 +312,21 @@ function createTerminalsConnector(
   return {
     async connect(terminal: XtermTerminal) {
       const [terminalsRuntime, terminalKey] = await Promise.all([runtime(), key()]);
-      logBinding = new ReplicaLog(terminalsRuntime.output.handle(terminalKey), {
+      const binding = new ReplicaLog(terminalsRuntime.output.handle(terminalKey), {
         store: createXtermLogSink(terminal),
       });
-      await logBinding.ready;
+      logBinding = binding;
+      await binding.ready;
       return () => {
-        void logBinding?.dispose();
-        logBinding = null;
+        if (logBinding === binding) logBinding = null;
+        void binding.dispose();
       };
+    },
+    park() {
+      return logBinding?.park();
+    },
+    resume() {
+      return logBinding?.resume();
     },
     sendInput(data: string) {
       const sentGeneration = generation();
