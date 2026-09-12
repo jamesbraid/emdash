@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { waitWithSignal } from '@emdash/shared/scheduling';
-import ssh2, { type Client } from 'ssh2';
+import ssh2, { type Client, type ConnectConfig } from 'ssh2';
 import type { ConnectionState, SshConnectionEvent, SshHealthState } from '@core/primitives/ssh/api';
 import { SshConnectionFailure } from '@core/primitives/ssh/api/node/connection-control';
 import type {
@@ -12,8 +12,8 @@ import { SshClientProxy } from './ssh-client-proxy';
 
 export class SshAuthError extends SshConnectionFailure {
   readonly name = 'SshAuthError';
-  constructor(message: string) {
-    super('authentication', message);
+  constructor(message: string, options?: ErrorOptions) {
+    super('authentication', message, options);
   }
 }
 export class SshTimeoutError extends SshConnectionFailure {
@@ -37,6 +37,8 @@ export interface SshConnectionManagerDeps {
     warn(message: string, metadata?: Record<string, unknown>): void;
     error(message: string, metadata?: Record<string, unknown>): void;
   };
+  /** Appended to an authentication failure when the host environment may be its cause. */
+  authFailureHint?: (config: ConnectConfig) => string | undefined;
 }
 type PhysicalConnection = {
   proxy: SshClientProxy;
@@ -255,7 +257,7 @@ export class SshConnectionManager extends EventEmitter implements SshConnectionM
         );
       });
       client.on('error', (error: Error) => {
-        const failure = classifyError(error);
+        const failure = this.classify(error, resolved.config);
         const wasCurrent = current();
         lose(failure);
         if (wasCurrent)
@@ -276,6 +278,12 @@ export class SshConnectionManager extends EventEmitter implements SshConnectionM
     });
   }
 
+  private classify(error: Error, config: ConnectConfig): SshConnectionFailure {
+    const failure = classifyError(error);
+    if (failure.kind !== 'authentication') return failure;
+    const hint = this.deps.authFailureHint?.(config);
+    return hint ? new SshAuthError(`${failure.message} (${hint})`, { cause: failure }) : failure;
+  }
   private isCurrent(id: string, entry: PhysicalConnection, generation: number): boolean {
     return this.connections.get(id) === entry && entry.generation === generation;
   }

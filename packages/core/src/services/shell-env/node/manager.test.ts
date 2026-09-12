@@ -1,10 +1,14 @@
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+const spawnMock = vi.fn();
 const spawnSyncMock = vi.fn();
 const existsSyncMock = vi.fn();
 const userInfoMock = vi.fn();
 
 vi.mock('node:child_process', () => ({
+  spawn: spawnMock,
   spawnSync: spawnSyncMock,
 }));
 
@@ -22,7 +26,44 @@ vi.mock('node:os', () => ({
 
 const { createShellEnvManager } = await import('./manager');
 
+type FakeChild = EventEmitter & {
+  pid: undefined;
+  exitCode: null;
+  signalCode: null;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  kill: () => boolean;
+};
+
+/** A probe child without a pid, so the process-tree terminator never signals a real process group. */
+function createFakeChild(): FakeChild {
+  return Object.assign(new EventEmitter(), {
+    pid: undefined,
+    exitCode: null,
+    signalCode: null,
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: () => true,
+  });
+}
+
+function answerProbe(child: FakeChild, stdout: string): void {
+  child.stdout.emit('data', stdout);
+  child.emit('close', 0, null);
+}
+
+function timedOutProbe() {
+  return {
+    error: Object.assign(new Error('spawnSync /bin/bash ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+    status: null,
+    signal: 'SIGTERM',
+    stderr: '',
+    stdout: '',
+  };
+}
+
 beforeEach(() => {
+  spawnMock.mockReset();
   spawnSyncMock.mockReset();
   existsSyncMock.mockReset();
   userInfoMock.mockReset();
@@ -199,5 +240,145 @@ describe('createShellEnvManager', () => {
       PATH: '/tools/good:/worker/bin',
       USER_VALUE: 'known-good',
     });
+    expect(manager.isDegraded()).toBe(false);
+  });
+
+  it('retries a timed-out probe once without blocking and applies the late capture', async () => {
+    const warn = vi.fn();
+    spawnSyncMock.mockReturnValueOnce(timedOutProbe());
+    spawnMock.mockImplementationOnce(() => {
+      const child = createFakeChild();
+      queueMicrotask(() => answerProbe(child, 'PATH=/shell/bin\nSSH_AUTH_SOCK=/run/agent.sock\n'));
+      return child;
+    });
+    const target: NodeJS.ProcessEnv = { PATH: '/worker/bin', SSH_AUTH_SOCK: '/launchd/Listeners' };
+    const manager = createShellEnvManager({
+      target,
+      baseEnvForProbe: () => ({ SHELL: '/bin/bash', PATH: '/worker/bin' }),
+      logger: { warn },
+    });
+
+    await manager.refresh();
+
+    expect(spawnSyncMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledWith(
+      '/bin/bash',
+      ['-ilc', 'env'],
+      expect.objectContaining({
+        detached: true,
+        env: expect.objectContaining({ DISABLE_AUTO_UPDATE: 'true' }),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    );
+    expect(target.SSH_AUTH_SOCK).toBe('/run/agent.sock');
+    expect(target.PATH).toBe('/shell/bin:/worker/bin');
+    expect(manager.getUserShellEnv().SSH_AUTH_SOCK).toBe('/run/agent.sock');
+    expect(manager.isDegraded()).toBe(false);
+    expect(warn).toHaveBeenCalledWith(
+      '[shell-env] Login-shell probe timed out; retried',
+      expect.objectContaining({
+        shell: '/bin/bash',
+        outcome: 'captured',
+        firstAttemptMs: expect.any(Number),
+        retryMs: expect.any(Number),
+      })
+    );
+  });
+
+  it('falls back to the bare env and marks the snapshot degraded after two timeouts', async () => {
+    const warn = vi.fn();
+    spawnSyncMock.mockReturnValueOnce(timedOutProbe());
+    spawnMock.mockImplementationOnce(() => createFakeChild());
+    const target: NodeJS.ProcessEnv = { PATH: '/usr/bin' };
+    const manager = createShellEnvManager({
+      target,
+      baseEnvForProbe: () => ({ SHELL: '/bin/bash', PATH: '/probe/bin' }),
+      retryTimeoutMs: 1,
+      logger: { warn },
+    });
+
+    await manager.refresh();
+
+    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(manager.isDegraded()).toBe(true);
+    expect(target).toEqual({ PATH: '/usr/bin' });
+    await expect(manager.current()).resolves.toEqual({
+      PATH: '/probe/bin',
+      SHELL: '/bin/bash',
+    });
+    expect(warn).toHaveBeenCalledWith(
+      '[shell-env] Login-shell probe timed out; retried',
+      expect.objectContaining({ shell: '/bin/bash', outcome: 'failed', retryTimeoutMs: 1 })
+    );
+    expect(warn).toHaveBeenCalledWith(
+      '[shell-env] Failed to resolve login-shell env',
+      expect.objectContaining({ shell: '/bin/bash' })
+    );
+  });
+
+  it('does not retry a shell that fails outright', async () => {
+    spawnSyncMock.mockReturnValueOnce({
+      error: undefined,
+      status: 2,
+      stderr: 'broken rc file',
+      stdout: '',
+    });
+    const manager = createShellEnvManager({
+      target: { PATH: '/worker/bin' },
+      baseEnvForProbe: () => ({ SHELL: '/bin/bash', PATH: '/worker/bin' }),
+      logger: { warn: vi.fn() },
+    });
+
+    await manager.refresh();
+
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(manager.isDegraded()).toBe(true);
+  });
+
+  it('re-captures a degraded snapshot from ensureFresh() without blocking, coalescing callers', async () => {
+    spawnSyncMock.mockReturnValueOnce(timedOutProbe());
+    spawnMock.mockImplementationOnce(() => createFakeChild());
+    const target: NodeJS.ProcessEnv = { PATH: '/worker/bin', SSH_AUTH_SOCK: '/launchd/Listeners' };
+    const manager = createShellEnvManager({
+      target,
+      baseEnvForProbe: () => ({ SHELL: '/bin/bash', PATH: '/worker/bin' }),
+      retryTimeoutMs: 1,
+    });
+    await manager.refresh();
+    expect(manager.isDegraded()).toBe(true);
+
+    spawnMock.mockImplementationOnce(() => {
+      const child = createFakeChild();
+      queueMicrotask(() => answerProbe(child, 'PATH=/shell/bin\nSSH_AUTH_SOCK=/run/agent.sock\n'));
+      return child;
+    });
+    await Promise.all([manager.ensureFresh(), manager.ensureFresh()]);
+
+    expect(spawnSyncMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(manager.isDegraded()).toBe(false);
+    expect(target.SSH_AUTH_SOCK).toBe('/run/agent.sock');
+    expect(manager.getUserShellEnv().SSH_AUTH_SOCK).toBe('/run/agent.sock');
+  });
+
+  it('leaves a fresh snapshot alone from ensureFresh()', async () => {
+    spawnSyncMock.mockReturnValue({
+      error: undefined,
+      status: 0,
+      stderr: '',
+      stdout: 'PATH=/shell/bin\n',
+    });
+    const manager = createShellEnvManager({
+      target: { PATH: '/worker/bin' },
+      baseEnvForProbe: () => ({ SHELL: '/bin/bash', PATH: '/worker/bin' }),
+    });
+    await manager.refresh();
+
+    await manager.ensureFresh();
+
+    expect(spawnSyncMock).toHaveBeenCalledOnce();
+    expect(spawnMock).not.toHaveBeenCalled();
+    expect(manager.isDegraded()).toBe(false);
   });
 });

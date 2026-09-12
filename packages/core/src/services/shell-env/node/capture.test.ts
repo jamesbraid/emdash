@@ -97,6 +97,60 @@ describe('captureShellEnv', () => {
         type: 'capture-failed',
         shell: '/bin/bash',
         message: 'broken rc file',
+        timedOut: false,
+      },
+    });
+  });
+
+  it('flags a probe that ran out of time so callers can retry', async () => {
+    userInfoMock.mockReturnValueOnce({ shell: '/bin/zsh' });
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValueOnce({
+      error: Object.assign(new Error('spawnSync /bin/zsh ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+      status: null,
+      signal: 'SIGTERM',
+      stderr: '',
+      stdout: '',
+    });
+
+    const result = await captureShellEnv({ baseEnv: { SHELL: '/bin/zsh' }, timeoutMs: 5_000 });
+
+    expect(result).toEqual({
+      success: false,
+      error: {
+        type: 'capture-failed',
+        shell: '/bin/zsh',
+        message: 'spawnSync /bin/zsh ETIMEDOUT',
+        timedOut: true,
+      },
+    });
+    expect(spawnSyncMock).toHaveBeenCalledWith(
+      '/bin/zsh',
+      ['-ilc', 'env'],
+      expect.objectContaining({ timeout: 5_000 })
+    );
+  });
+
+  it('treats a shell killed by a signal as a failure rather than a partial capture', async () => {
+    userInfoMock.mockReturnValueOnce({ shell: '/bin/bash' });
+    existsSyncMock.mockReturnValue(true);
+    spawnSyncMock.mockReturnValueOnce({
+      error: undefined,
+      status: null,
+      signal: 'SIGKILL',
+      stderr: '',
+      stdout: 'PATH=/partial\n',
+    });
+
+    const result = await captureShellEnv({ baseEnv: { SHELL: '/bin/bash' } });
+
+    expect(result).toEqual({
+      success: false,
+      error: {
+        type: 'capture-failed',
+        shell: '/bin/bash',
+        message: 'shell env capture was killed by SIGKILL',
+        timedOut: false,
       },
     });
   });

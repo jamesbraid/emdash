@@ -65,9 +65,12 @@ export function getUserShellEnv(): Record<string, string> {
 }
 
 /**
- * Starts `$SHELL -ilc 'env'` with a 5 s timeout and returns immediately. On
- * any error (timeout, missing shell, restricted environment) the manager logs
- * a warning and retains a sanitized usable environment.
+ * Runs `$SHELL -ilc 'env'` with a 5 s budget. That first probe holds the main
+ * thread so later boot phases see the captured `process.env`; if it merely
+ * times out, the manager retries once for 15 s without blocking. On any other
+ * error (missing shell, restricted environment) it logs a warning and retains a
+ * sanitized usable environment, marked degraded so an SSH connect can give the
+ * capture another chance first.
  *
  * Spawn-capable runtimes request the separately owned snapshot through the
  * parent controller; the manager makes their first request await this capture.

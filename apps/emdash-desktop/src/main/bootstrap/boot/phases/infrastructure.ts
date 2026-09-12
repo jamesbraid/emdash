@@ -13,6 +13,7 @@ import { getDesktopClientId } from '@main/core/runtime/desktop-client-id';
 import { encryptedAppSecretsStore } from '@main/host/secrets/encrypted-app-secrets-store';
 import { log } from '@main/lib/logger';
 import { telemetryService } from '@main/lib/telemetry';
+import { userShellEnvManager } from '@main/lib/userEnv';
 import { appScope } from '../../core/app-scope';
 import type { DatabaseBundle } from './database';
 
@@ -28,6 +29,7 @@ export async function bootInfrastructure(database: DatabaseBundle): Promise<Infr
     credentials: new SshCredentialService(encryptedAppSecretsStore),
     prepareCredentials: (id, credentials) =>
       encryptedAppSecretsStore.prepareChanges(sshCredentialChanges(id, credentials)),
+    shellEnv: userShellEnvManager,
     logger: log,
     telemetry: telemetryService,
   });

@@ -475,6 +475,47 @@ describe('SshConnectionManager', () => {
     ).rejects.toBeInstanceOf(SshTimeoutError);
   });
 
+  it('appends the configured hint to agent authentication failures', async () => {
+    const { SshAuthError, SshConnectionManager } = await import('./ssh-connection-manager');
+    class AuthFailureClient extends PassThrough {
+      connect() {
+        queueMicrotask(() =>
+          this.emit('error', new Error('All configured authentication methods failed'))
+        );
+      }
+    }
+    const hint = 'login-shell environment was not captured; SSH_AUTH_SOCK may be wrong';
+    const publishEvent = vi.fn();
+    const manager = new SshConnectionManager({
+      createClient: () => new AuthFailureClient() as unknown as Client,
+      publishEvent,
+      authFailureHint: (config) => (config.agent ? hint : undefined),
+    });
+    const resolve = (agent?: string) => async () => ({
+      config: { sock: new PassThrough(), username: 'alice', agent },
+      cleanup: () => {},
+      debugLogs: [],
+    });
+
+    const failure = await manager
+      .createConnection('agent-auth', resolve('/tmp/agent.sock'))
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SshAuthError);
+    expect((failure as Error).message).toBe(
+      `All configured authentication methods failed (${hint})`
+    );
+    expect(publishEvent).toHaveBeenCalledWith({
+      type: 'error',
+      connectionId: 'agent-auth',
+      errorMessage: `All configured authentication methods failed (${hint})`,
+    });
+
+    await expect(manager.createConnection('key-auth', resolve())).rejects.toThrow(
+      /^All configured authentication methods failed$/
+    );
+  });
+
   it('stops reconnecting immediately after an auth failure during reconnect', async () => {
     vi.useFakeTimers();
     try {
