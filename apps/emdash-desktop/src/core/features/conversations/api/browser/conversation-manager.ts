@@ -566,14 +566,21 @@ function createTuiAgentsConnector(
   return {
     async connect(terminal: Terminal) {
       const runtime = await client();
-      logBinding = new ReplicaLog(runtime.tui.output.handle({ conversationId }), {
+      const binding = new ReplicaLog(runtime.tui.output.handle({ conversationId }), {
         store: createXtermLogSink(terminal),
       });
-      await logBinding.ready;
+      logBinding = binding;
+      await binding.ready;
       return () => {
-        void logBinding?.dispose();
-        logBinding = null;
+        if (logBinding === binding) logBinding = null;
+        void binding.dispose();
       };
+    },
+    park() {
+      return logBinding?.park();
+    },
+    resume() {
+      return logBinding?.resume();
     },
     sendInput(data: string) {
       const sentGeneration = generation();
