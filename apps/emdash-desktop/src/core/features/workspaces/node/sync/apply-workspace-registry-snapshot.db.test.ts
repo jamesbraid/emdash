@@ -1,13 +1,25 @@
-import type { WorkspaceRecord } from '@emdash/core/runtimes/workspace-registry/api';
+import type {
+  WorkspaceRecord,
+  WorkspaceRecords,
+} from '@emdash/core/runtimes/workspace-registry/api';
 import { openFixture } from '@tooling/utils/db';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createWorkspaceRegistry } from '@core/features/workspaces/api/node/registry';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createWorkspaceRegistry,
+  workspaceRegistryTable,
+} from '@core/features/workspaces/api/node/registry';
+import type { WorkspaceRow } from '@core/services/app-db/node/schema';
 import {
   applyWorkspaceRegistrySnapshot,
   WorkspaceIdentityConflictError,
 } from './apply-workspace-registry-snapshot';
 
 const LOCAL_HOST = { location: 'local', sshConnectionId: null } as const;
+
+/** Distinct epoch-ms observation stamps, one per delivery. */
+function stamp(delivery: number): number {
+  return Date.parse('2026-02-01T00:00:00.000Z') + delivery * 3_600_000;
+}
 
 function hostRecord(overrides: Partial<WorkspaceRecord> & { id: string }): WorkspaceRecord {
   return {
@@ -99,6 +111,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(result).toEqual({
       adopted: 2,
       refreshed: 0,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 0,
@@ -144,6 +157,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(replay).toEqual({
       adopted: 0,
       refreshed: 2,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 0,
@@ -224,6 +238,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(withOverlay).toEqual({
       adopted: 0,
       refreshed: 1,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 0,
@@ -339,6 +354,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(result).toEqual({
       adopted: 0,
       refreshed: 0,
+      unchanged: 0,
       markedMissing: 1,
       untracked: 1,
       purgedTombstones: 0,
@@ -348,6 +364,26 @@ describe('applyWorkspaceRegistrySnapshot', () => {
       observedAt: Date.parse('2026-01-07T00:00:00.000Z'),
     });
     expect(registry.getLive('wt-mirror')).toBeUndefined();
+
+    // Still absent on the next delivery: the stamp moves, nothing is re-marked.
+    const again = await applyWorkspaceRegistrySnapshot({
+      db: fixture.db,
+      host: LOCAL_HOST,
+      records: {},
+      observedAt: Date.parse('2026-01-08T00:00:00.000Z'),
+    });
+    expect(again).toEqual({
+      adopted: 0,
+      refreshed: 0,
+      unchanged: 1,
+      markedMissing: 0,
+      untracked: 0,
+      purgedTombstones: 0,
+    });
+    expect(registry.getLive('wt-linked')).toMatchObject({
+      observedStatus: 'missing',
+      observedAt: Date.parse('2026-01-08T00:00:00.000Z'),
+    });
   });
 
   it('purges a tombstoned row once the delivery confirms the record gone — annotation included', async () => {
@@ -378,6 +414,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(pending).toEqual({
       adopted: 0,
       refreshed: 1,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 0,
@@ -395,6 +432,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(purged).toEqual({
       adopted: 0,
       refreshed: 0,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 1,
@@ -429,6 +467,7 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     expect(result).toEqual({
       adopted: 0,
       refreshed: 0,
+      unchanged: 0,
       markedMissing: 0,
       untracked: 0,
       purgedTombstones: 0,
@@ -562,5 +601,152 @@ describe('applyWorkspaceRegistrySnapshot', () => {
     ).resolves.toMatchObject({ refreshed: 2 });
     expect(registry.getLive('first')).toMatchObject({ path: '/second' });
     expect(registry.getLive('second')).toMatchObject({ path: '/first' });
+  });
+
+  /**
+   * The host re-delivers its full record map on every change, several times a second
+   * while agents work. Rows whose observation did not change must cost one batched
+   * timestamp stamp, not a read-and-rewrite each.
+   */
+  describe('unchanged rows', () => {
+    function snapshotOf(worktrees: number): WorkspaceRecords {
+      const records: Record<string, WorkspaceRecord> = {
+        'ws-repo': hostRecord({
+          id: 'ws-repo',
+          kind: 'repository',
+          path: '/repos/app',
+          parentId: null,
+          gitAdminName: null,
+        }),
+      };
+      for (let index = 0; index < worktrees; index += 1) {
+        records[`wt-${index}`] = hostRecord({ id: `wt-${index}` });
+      }
+      return records;
+    }
+
+    function apply(records: WorkspaceRecords, observedAt: number) {
+      return applyWorkspaceRegistrySnapshot({
+        db: fixture.db,
+        host: LOCAL_HOST,
+        records,
+        observedAt,
+      });
+    }
+
+    function liveRows(): WorkspaceRow[] {
+      return fixture.db
+        .select()
+        .from(workspaceRegistryTable)
+        .all()
+        .sort((left, right) => left.id.localeCompare(right.id));
+    }
+
+    /** Everything but the stamps, which are expected to move on every delivery. */
+    function observation(row: WorkspaceRow) {
+      const { observedAt: _observedAt, updatedAt: _updatedAt, ...columns } = row;
+      return columns;
+    }
+
+    /** Statement kinds prepared while `run` executes, transaction bookkeeping excluded. */
+    async function statementsDuring<T>(
+      run: () => Promise<T>
+    ): Promise<{ result: T; statements: Record<string, number> }> {
+      const prepare = vi.spyOn(fixture.sqlite, 'prepare');
+      try {
+        const result = await run();
+        const statements: Record<string, number> = {};
+        for (const [sql] of prepare.mock.calls) {
+          const kind = String(sql).trimStart().split(/\s+/, 1)[0]?.toUpperCase() ?? '';
+          if (kind === 'BEGIN' || kind === 'COMMIT' || kind === 'ROLLBACK') continue;
+          statements[kind] = (statements[kind] ?? 0) + 1;
+        }
+        return { result, statements };
+      } finally {
+        prepare.mockRestore();
+      }
+    }
+
+    it('re-delivers an identical snapshot in a fixed number of statements, moving only observedAt', async () => {
+      const small = snapshotOf(3);
+      await apply(small, stamp(1));
+      const { statements: smallStatements } = await statementsDuring(() => apply(small, stamp(2)));
+
+      const large = snapshotOf(40);
+      await apply(large, stamp(3));
+      const before = liveRows();
+      const { result, statements } = await statementsDuring(() => apply(large, stamp(4)));
+
+      expect(result).toEqual({
+        adopted: 0,
+        refreshed: 0,
+        unchanged: 41,
+        markedMissing: 0,
+        untracked: 0,
+        purgedTombstones: 0,
+      });
+      // Host rows, the two annotation lookups, tombstones; then one batched stamp.
+      expect(statements).toEqual({ SELECT: 4, UPDATE: 1 });
+      expect(statements).toEqual(smallStatements);
+      const after = liveRows();
+      expect(after.map(observation)).toEqual(before.map(observation));
+      expect(after.map((row) => row.observedAt)).toEqual(after.map(() => stamp(4)));
+    });
+
+    it('refreshes exactly the rows whose observation changed', async () => {
+      const records = snapshotOf(5);
+      await apply(records, stamp(1));
+      const before = liveRows();
+      const base = hostRecord({ id: 'wt-2' });
+      const changed: WorkspaceRecords = {
+        ...records,
+        'wt-2': { ...base, git: base.git === null ? null : { ...base.git, dirty: false } },
+      };
+
+      const { result, statements } = await statementsDuring(() => apply(changed, stamp(2)));
+
+      expect(result).toEqual({
+        adopted: 0,
+        refreshed: 1,
+        unchanged: 5,
+        markedMissing: 0,
+        untracked: 0,
+        purgedTombstones: 0,
+      });
+      // Only the changed row pays for refresh's path checks and its own write.
+      expect(statements).toEqual({ SELECT: 6, UPDATE: 2 });
+      const after = liveRows();
+      expect(after.find((row) => row.id === 'wt-2')?.observedGit).toMatchObject({ dirty: false });
+      const others = (rows: WorkspaceRow[]) =>
+        rows.filter((row) => row.id !== 'wt-2').map(observation);
+      expect(others(after)).toEqual(others(before));
+      expect(after.map((row) => row.observedAt)).toEqual(after.map(() => stamp(2)));
+    });
+
+    it('treats a Host respelling of the stored path as unchanged and keeps the stored display', async () => {
+      const registry = createWorkspaceRegistry(fixture.db);
+      registry.recordCreationIntent({
+        id: 'ws-repo',
+        type: 'local',
+        kind: 'repository',
+        location: 'local',
+        path: 'C:\\Repo',
+      });
+      const record = hostRecord({
+        id: 'ws-repo',
+        kind: 'repository',
+        path: 'c:\\REPO',
+        parentId: null,
+        gitAdminName: null,
+      });
+      // The first delivery fills the observation columns the creation intent left empty.
+      await apply({ 'ws-repo': record }, stamp(1));
+      expect(registry.getLive('ws-repo')?.path).toBe('C:\\Repo');
+
+      const again = await apply({ 'ws-repo': record }, stamp(2));
+
+      expect(again).toMatchObject({ refreshed: 0, unchanged: 1 });
+      expect(registry.getLive('ws-repo')).toMatchObject({ path: 'C:\\Repo', observedAt: stamp(2) });
+    });
   });
 });

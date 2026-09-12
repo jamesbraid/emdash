@@ -5,10 +5,26 @@ import { sshConnections } from '@core/services/app-db/node/schema';
 import {
   createWorkspaceRegistry,
   isAnnotatedWorkspace,
+  observationMatchesRow,
   workspaceRegistryTable,
+  type WorkspaceObservation,
 } from './workspace-registry';
 
 const LOCAL_HOST = { location: 'local', sshConnectionId: null } as const;
+
+const OBSERVED_GIT = {
+  version: '2',
+  branch: 'main',
+  dirty: true,
+  diffStats: { added: 4, deleted: 1 },
+  ahead: null,
+  behind: null,
+  locked: false,
+  prunable: false,
+  headOid: null,
+  upstream: null,
+  prBreadcrumb: null,
+} as const;
 
 function hostRecord(id: string, path: string, kind: WorkspaceRecord['kind'] = 'repository') {
   return {
@@ -409,6 +425,79 @@ describe('WorkspaceRegistry', () => {
         .all()
         .map((row) => row.id)
     ).not.toContain('workspace');
+  });
+
+  it('tells a matching delivered observation from a changed one, respellings included', () => {
+    const registry = createWorkspaceRegistry(fixture.db);
+    registry.adopt({
+      id: 'workspace',
+      type: 'local',
+      kind: 'repository',
+      location: 'local',
+      path: 'C:\\Repo',
+      parentId: null,
+      origin: 'registered',
+      observedStatus: 'present',
+      observedGit: OBSERVED_GIT,
+      observedAt: 1,
+    });
+    const row = registry.getLive('workspace');
+    if (row === undefined) throw new Error('adopted row missing');
+    const delivered: WorkspaceObservation = {
+      kind: 'repository',
+      path: 'c:\\REPO',
+      parentId: null,
+      origin: 'registered',
+      observedStatus: 'present',
+      observedGit: { ...OBSERVED_GIT, diffStats: { added: 4, deleted: 1 } },
+      lastCreateOutcome: null,
+      lastRemovalAttempt: null,
+      scriptOutcomes: null,
+      runtimeOverlay: null,
+      lastActivatedAt: null,
+      observedAt: 2,
+      location: 'local',
+      sshConnectionId: null,
+    };
+
+    expect(observationMatchesRow(row, delivered)).toBe(true);
+    expect(observationMatchesRow(row, { ...delivered, path: 'C:\\Elsewhere' })).toBe(false);
+    expect(
+      observationMatchesRow(row, { ...delivered, observedGit: { ...OBSERVED_GIT, dirty: false } })
+    ).toBe(false);
+    expect(observationMatchesRow(row, { ...delivered, sshConnectionId: 'ssh-1' })).toBe(false);
+    // A partial observation compares only the columns it carries.
+    expect(observationMatchesRow(row, { observedStatus: 'present', observedAt: 3 })).toBe(true);
+    expect(observationMatchesRow(row, { observedStatus: 'missing' })).toBe(false);
+  });
+
+  it('stamps a batch of live rows with one observation timestamp and nothing else', () => {
+    const registry = createWorkspaceRegistry(fixture.db, {
+      now: () => '2026-01-03T00:00:00.000Z',
+    });
+    for (const id of ['one', 'two']) {
+      registry.adopt({
+        id,
+        type: 'local',
+        kind: 'worktree',
+        location: 'local',
+        path: `/repo/${id}`,
+        observedStatus: 'present',
+        observedGit: OBSERVED_GIT,
+        observedAt: 1,
+      });
+    }
+    registry.untrack(['two'], '2026-01-02T00:00:00.000Z');
+
+    expect(registry.stampObserved(['one', 'two', 'absent'], 5)).toBe(1);
+    expect(registry.stampObserved([], 6)).toBe(0);
+    expect(registry.getLive('one')).toMatchObject({
+      path: '/repo/one',
+      observedStatus: 'present',
+      observedGit: OBSERVED_GIT,
+      observedAt: 5,
+      updatedAt: '2026-01-03T00:00:00.000Z',
+    });
   });
 
   it('defines annotations as provenance or desktop links', () => {
