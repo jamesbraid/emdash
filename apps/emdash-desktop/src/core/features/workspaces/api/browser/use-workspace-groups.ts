@@ -26,9 +26,9 @@ function getWorkspaceGroupsRemote(): Promise<
 
 /**
  * Mirror-served workspace groups, live: the node-side family re-queries on app-db
- * pokes (the registry sync pokes on every applied host snapshot), so host-side
- * changes stream in without any pull loop. Works from the cached mirror while the
- * host is unreachable — staleness shows through each row's `lastObservedAt`.
+ * pokes (the registry sync pokes whenever a host snapshot changes the mirror), so
+ * host-side changes stream in without any pull loop. Works from the cached mirror
+ * while the host is unreachable — staleness shows through each row's `lastObservedAt`.
  */
 export function useWorkspaceGroups(scope: WorkspacesScope, enabled: boolean) {
   const hostKey = scope.kind === 'local' ? 'local' : `ssh:${scope.machineId}`;

@@ -30,8 +30,8 @@ export type ProjectWorkspacesWireController = {
 
 /**
  * Mirror-served workspace groups as a live model (planning ticket 09): the registry
- * sync pokes `appDbPokes.workspaces` on every applied snapshot, so the family
- * re-queries the mirror and streams updates — the renderer never polls.
+ * sync pokes `appDbPokes.workspaces` for every project a snapshot changed, so the
+ * family re-queries the mirror and streams updates — the renderer never polls.
  */
 export function createProjectWorkspacesWireController(
   dependencies: ProjectWorkspaceOperationDependencies
