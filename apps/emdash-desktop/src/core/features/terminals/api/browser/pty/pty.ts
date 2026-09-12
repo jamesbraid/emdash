@@ -11,6 +11,7 @@ import { log } from '@core/primitives/logging/browser/logger';
 import { cssColorToHex, cssVar } from '@core/primitives/styling/browser/cssVars';
 import { decodeOsc52ClipboardData } from '../../../browser/pty/pty-clipboard';
 import { ensureXtermHost } from '../../../browser/pty/xterm-host';
+import { createParkedOutput, type ParkedOutput } from './parked-output';
 
 /**
  * Task-terminal scrollback. The main side retains only 1 MB of output per PTY
@@ -19,6 +20,13 @@ import { ensureXtermHost } from '../../../browser/pty/xterm-host';
  * dominant per-terminal memory cost ~10× versus the previous 100k.
  */
 const SCROLLBACK_LINES = 10_000;
+/**
+ * How long a parked terminal keeps streaming output nobody can see. Long
+ * enough that flipping between tabs never touches the transport, short enough
+ * that a session left in the background stops costing the renderer and the
+ * wire.
+ */
+const PARKED_OUTPUT_LINGER_MS = 30_000;
 
 export const TERMINAL_PADDING_PX = 8;
 // The DOM renderer cannot draw custom contiguous block glyphs. Keep xterm's
@@ -36,6 +44,10 @@ export interface SessionTheme {
 
 export type FrontendPtyConnector = {
   connect(terminal: Terminal): Promise<() => void> | (() => void);
+  /** Releases the output transport while keeping the replica; see `resume`. */
+  park?(): Promise<void> | void;
+  /** Re-attaches a parked transport and catches the replica up from its offset. */
+  resume?(): Promise<void> | void;
   sendInput?(data: string): void;
   resize?(cols: number, rows: number): void;
 };
@@ -74,13 +86,16 @@ export function buildTheme(theme?: SessionTheme): ITerminalOptions['theme'] {
  *
  * Owns the xterm Terminal instance for the full lifetime of the session.
  * The terminal is created synchronously during construction and opened into
- * an off-screen container. Call connect() to subscribe to the main-process
- * ring buffer and live IPC events — this writes historical output directly
- * to xterm and sets up ongoing data delivery without any renderer-side buffer.
+ * an off-screen container. Call connect() to subscribe to the runtime's
+ * retained output log — this writes historical output directly to xterm and
+ * sets up ongoing data delivery without any renderer-side buffer.
  *
  * DOM management is handled via mount() / unmount():
- *  - mount()   → appends ownedContainer to the visible mount target
- *  - unmount() → moves ownedContainer back to the off-screen host
+ *  - mount()   → appends ownedContainer to the visible mount target and
+ *                resumes parked output
+ *  - unmount() → moves ownedContainer back to the off-screen host and starts
+ *                the output linger; once it expires the output transport is
+ *                parked while the replica keeps its offset
  *
  * Lifecycle: created and owned by PtySession (stores/pty-session.ts), one per
  * live session. Survives React component unmounts (e.g. navigating away from a
@@ -96,6 +111,8 @@ export class FrontendPty {
   readonly ownedContainer: HTMLDivElement;
   private theme?: SessionTheme;
   private offData: (() => void) | null = null;
+  private readonly output: ParkedOutput;
+  private disposed = false;
 
   constructor(
     readonly sessionId: string,
@@ -105,6 +122,19 @@ export class FrontendPty {
     private readonly connector: FrontendPtyConnector = noopConnector()
   ) {
     this.theme = theme;
+    this.output = createParkedOutput({
+      lingerMs: PARKED_OUTPUT_LINGER_MS,
+      park: () => {
+        void Promise.resolve(this.connector.park?.()).catch((error) => {
+          log.warn('FrontendPty: failed to park output', { sessionId: this.sessionId, error });
+        });
+      },
+      resume: () => {
+        void Promise.resolve(this.connector.resume?.()).catch((error) => {
+          log.warn('FrontendPty: failed to resume output', { sessionId: this.sessionId, error });
+        });
+      },
+    });
     this.ownedContainer = document.createElement('div');
     Object.assign(this.ownedContainer.style, {
       width: '100%',
@@ -206,12 +236,21 @@ export class FrontendPty {
 
   /**
    * Subscribe to the runtime-backed retained output log and mark status as
-   * ready once the connector has replayed its snapshot.
+   * ready once the connector has replayed its snapshot. The subscription
+   * lives until the next connect() or dispose(); while the terminal sits
+   * off-screen past the linger, only its transport is parked.
    */
   async connect(): Promise<void> {
     this.offData?.();
     this.offData = null;
-    this.offData = await this.connector.connect(this.terminal);
+    const offData = await this.connector.connect(this.terminal);
+    if (this.disposed) {
+      // Disposed while subscribing: let go now rather than stream into a dead terminal.
+      offData();
+      return;
+    }
+    this.offData = offData;
+    this.output.connected();
   }
 
   sendInput(data: string): void {
@@ -235,6 +274,7 @@ export class FrontendPty {
       this.terminal.resize(targetDims.cols, targetDims.rows);
     }
     mountTarget.appendChild(this.ownedContainer);
+    this.output.mount();
     // Force a repaint after reparenting in the DOM.
     const t = this.terminal;
     requestAnimationFrame(() => {
@@ -254,9 +294,16 @@ export class FrontendPty {
    * the viewport, so the core IntersectionObserver reports zero intersection
    * and refreshes are skipped until the terminal is mounted again. The text
    * buffer stays intact for an instant, pixel-faithful restore.
+   *
+   * Output keeps streaming for the linger, so flipping between tabs costs
+   * nothing. After it the transport is parked; the replica keeps its offset,
+   * so the next mount appends just the output missed while hidden. Only a
+   * gap larger than the runtime's retained tail resets the terminal, exactly
+   * like a first open.
    */
   unmount(): void {
     ensureXtermHost().appendChild(this.ownedContainer);
+    this.output.unmount();
   }
 
   /**
@@ -267,6 +314,8 @@ export class FrontendPty {
   dispose(): void {
     FrontendPty.all.delete(this);
     FrontendPty.bySession.delete(this.sessionId);
+    this.disposed = true;
+    this.output.dispose();
     this.offData?.();
     this.offData = null;
     try {

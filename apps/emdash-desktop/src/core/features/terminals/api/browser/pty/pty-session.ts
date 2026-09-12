@@ -78,6 +78,8 @@ export class PtySession {
                 this.onOpenExternal,
                 {
                   connect: (terminal) => this.connector.connect(terminal),
+                  park: () => this.connector.park?.(),
+                  resume: () => this.connector.resume?.(),
                   sendInput: (data) => {
                     if (this.status === 'ready' && this.canConnect())
                       this.connector.sendInput?.(data);
