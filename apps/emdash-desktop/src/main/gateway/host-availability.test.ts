@@ -3,6 +3,7 @@ import { runtimeHostUnavailable } from '@emdash/core/primitives/runtime-resoluti
 import { err, ok } from '@emdash/shared';
 import { createScope } from '@emdash/shared/concurrency';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { HostInvalidation } from '@core/services/hosts/api';
 import type { Hosts } from '@core/services/hosts/node/hosts';
 import {
   createSupervisorDriver,
@@ -122,6 +123,67 @@ describe('desktop Host availability supervisor projection', () => {
     expect(fixture.peer.opens).toBe(2);
   });
 });
+
+describe('runtime broker binding lifecycle on machine mutation', () => {
+  it('keeps the runtime binding when a machine record is saved', async () => {
+    const invalidate = createInvalidationCapture();
+    const forget = vi.fn();
+    const scope = createScope({ label: 'machine-saved-test' });
+    createDesktopHostAvailability({
+      scope,
+      hosts: invalidate.hosts,
+      runtimes: { rebind: vi.fn(), forget },
+      localReady: vi.fn(async () => {}),
+    });
+
+    invalidate.emit({ connectionId: 'ssh-1', reason: 'machine-saved' });
+
+    expect(forget).not.toHaveBeenCalled();
+    await scope.dispose();
+  });
+
+  it('forgets the runtime binding when a machine record is deleted', async () => {
+    const invalidate = createInvalidationCapture();
+    const forget = vi.fn();
+    const scope = createScope({ label: 'machine-deleted-test' });
+    createDesktopHostAvailability({
+      scope,
+      hosts: invalidate.hosts,
+      runtimes: { rebind: vi.fn(), forget },
+      localReady: vi.fn(async () => {}),
+    });
+
+    invalidate.emit({ connectionId: 'ssh-1', reason: 'machine-deleted' });
+
+    expect(forget).toHaveBeenCalledExactlyOnceWith(hostRef('remote', 'ssh-1'));
+    await scope.dispose();
+  });
+});
+
+function createInvalidationCapture() {
+  let listener: ((event: HostInvalidation) => void) | undefined;
+  const hosts: Pick<
+    Hosts,
+    'get' | 'availability' | 'lease' | 'wake' | 'revalidate' | 'onReady' | 'onInvalidate'
+  > = {
+    get: () => undefined,
+    availability: () => ({}) as never,
+    lease: () => {},
+    wake: () => {},
+    revalidate: () => {},
+    onReady: () => () => {},
+    onInvalidate: (l) => {
+      listener = l;
+      return () => {
+        listener = undefined;
+      };
+    },
+  };
+  return {
+    hosts,
+    emit: (event: HostInvalidation) => listener?.(event),
+  };
+}
 
 function createFixture() {
   const scope = createScope({ label: 'desktop-supervisor-test' });

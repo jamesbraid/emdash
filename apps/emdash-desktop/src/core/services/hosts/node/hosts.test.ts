@@ -259,8 +259,14 @@ describe('Hosts production supervisor ownership', () => {
     expect(next.kind).toBe('ready');
     if (generation.kind === 'ready' && next.kind === 'ready')
       expect(next.generation).toBeGreaterThan(generation.generation);
-    expect(fixture.invalidations).toEqual([{ connectionId: 'ssh-1', reason: 'machine-mutation' }]);
+    expect(fixture.invalidations).toEqual([{ connectionId: 'ssh-1', reason: 'machine-saved' }]);
     expect(ports.cancel).toHaveBeenCalledWith();
+  });
+
+  it('reports a distinct invalidation reason when a machine record is deleted', () => {
+    fixture.service.lease('ssh-1', fixture.scope);
+    fixture.mutate('deleted');
+    expect(fixture.invalidations).toEqual([{ connectionId: 'ssh-1', reason: 'machine-deleted' }]);
   });
 
   it('releases retired lease scopes when a project lease is rebound', async () => {
@@ -349,7 +355,7 @@ function createFixture() {
   let connected = false;
   let intended = true;
   let sshEvent: ((event: SshConnectionManagerEvent) => void) | undefined;
-  let mutation: ((event: { connectionId: string }) => void) | undefined;
+  let mutation: ((event: { connectionId: string; type: 'saved' | 'deleted' }) => void) | undefined;
   const proxy = {
     get isConnected() {
       return connected;
@@ -406,7 +412,7 @@ function createFixture() {
     },
     establish,
     invalidations,
-    mutate: () => mutation?.({ connectionId: 'ssh-1' }),
+    mutate: (type: 'saved' | 'deleted' = 'saved') => mutation?.({ connectionId: 'ssh-1', type }),
     closeSsh: () => {
       connected = false;
       sshEvent?.({ type: 'disconnected', connectionId: 'ssh-1' });

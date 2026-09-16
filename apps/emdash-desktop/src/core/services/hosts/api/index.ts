@@ -29,11 +29,14 @@ export {
 
 export type HostInvalidation = {
   connectionId: string;
-  reason: 'reconnect-failed' | 'machine-mutation' | 'connection-lost';
+  reason: 'reconnect-failed' | 'machine-saved' | 'machine-deleted' | 'connection-lost';
   target?: WorkspaceServerTarget;
   error?: unknown;
 };
 
 export type MachineMutationEvents = {
-  on(name: 'machine:mutated', handler: (event: { connectionId: string }) => void): () => void;
+  on(
+    name: 'machine:mutated',
+    handler: (event: { type: 'saved' | 'deleted'; connectionId: string }) => void
+  ): () => void;
 };
