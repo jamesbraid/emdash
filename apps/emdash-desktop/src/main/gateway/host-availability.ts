@@ -62,7 +62,11 @@ export function createDesktopHostAvailability(
     })
   );
   options.scope.add(
-    options.hosts.onInvalidate(({ connectionId }) => {
+    options.hosts.onInvalidate(({ connectionId, reason }) => {
+      // A save retires and re-creates the host service in place: the same connection id
+      // reconnects and `onReady` fires again, so `rebind()` re-points the existing binding
+      // and its retained attachments. Only a delete makes the identity itself gone for good.
+      if (reason !== 'machine-deleted') return;
       options.runtimes.forget(hostRef('remote', connectionId));
     })
   );

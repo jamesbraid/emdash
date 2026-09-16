@@ -113,11 +113,12 @@ export function createHosts(options: CreateHostsOptions): Hosts {
     options.ssh.manager.off('connection-event', onSshEvent);
   });
   scope.add(
-    options.machineEvents.on('machine:mutated', ({ connectionId: id }) => {
+    options.machineEvents.on('machine:mutated', ({ connectionId: id, type }) => {
       void retire(id);
+      const reason = type === 'deleted' ? 'machine-deleted' : 'machine-saved';
       for (const listener of invalidationListeners) {
         try {
-          listener({ connectionId: id, reason: 'machine-mutation' });
+          listener({ connectionId: id, reason });
         } catch {
           /* An observer cannot prevent lease rebinding or other observers. */
         }

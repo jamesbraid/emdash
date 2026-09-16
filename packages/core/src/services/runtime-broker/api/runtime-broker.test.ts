@@ -131,6 +131,53 @@ describe('RuntimeBroker', () => {
     expect(secondDetach).toHaveBeenCalledOnce();
   });
 
+  it('re-establishes a retained live handle across an explicit rebind to a new connection', async () => {
+    const host = hostRef('remote', 'remote-1');
+    const firstDetach = vi.fn();
+    const firstConnection = connection(vi.fn(async () => firstDetach));
+    const secondDetach = vi.fn();
+    const secondAttach = vi.fn(async () => secondDetach);
+    const secondConnection = connection(secondAttach);
+    const broker = new RuntimeBroker({
+      resolve: () => ok({ client: {} as HostRuntimesClient, connection: firstConnection }),
+    });
+    const retained = await broker.client(host);
+    expect(retained.success).toBe(true);
+    if (!retained.success) throw new Error('Expected the first Host runtime');
+    const handle = retained.data.files.tree.model.state({} as never, 'tree');
+    const reattached = vi.fn();
+    await handle.attach(vi.fn(), { onReattach: reattached });
+
+    const reboundClient = broker.rebind(host, {
+      client: {} as HostRuntimesClient,
+      connection: secondConnection,
+    });
+
+    expect(reboundClient).toBe(retained.data);
+    await vi.waitFor(() => expect(secondAttach).toHaveBeenCalledOnce());
+    expect(firstDetach).toHaveBeenCalledOnce();
+    expect(reattached).toHaveBeenCalledOnce();
+  });
+
+  it('rejects calls through a retained client once the identity is forgotten', async () => {
+    const host = hostRef('remote', 'remote-1');
+    const call = vi.fn(async () => 'ok');
+    const broker = new RuntimeBroker({
+      resolve: () =>
+        ok({ client: {} as HostRuntimesClient, connection: connection(vi.fn(), call) }),
+    });
+    const retained = await broker.client(host);
+    expect(retained.success).toBe(true);
+    if (!retained.success) throw new Error('Expected the first Host runtime');
+
+    broker.forget(host);
+
+    await expect(retained.data.files.getHomeDir(undefined)).rejects.toMatchObject({
+      code: 'DISCONNECTED',
+      message: 'Runtime identity disposed',
+    });
+  });
+
   it('disposes retained attachments when an incompatible binding replaces them', async () => {
     const host = hostRef('remote', 'remote-1');
     const detach = vi.fn();
