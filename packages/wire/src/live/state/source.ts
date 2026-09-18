@@ -41,6 +41,15 @@ export class LiveStateSource<T> {
   }
 
   /**
+   * The live authoritative value, uncloned. Internal callers that only compare
+   * against it (never mutate it) can use this instead of {@link snapshot}, which
+   * clones. The clone in `snapshot()` stays required for anything leaving this class.
+   */
+  get value(): T {
+    return this.current;
+  }
+
+  /**
    * Returns a deep-cloned snapshot of the current state.
    * Use this to respond to the `snapshot` contract endpoint.
    */

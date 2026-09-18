@@ -325,9 +325,13 @@ export function expose<Group extends LiveModelDef>(
   ): LiveCursor {
     const mutationIds = current.mutationIds ? [...current.mutationIds] : undefined;
     if (publishMode(record) === 'diff') {
+      // The base the draft is created from is liveState's own pre-produce value —
+      // captured before produce() swaps it, so assignDraft can skip any key whose
+      // value didn't move without reading it off the draft.
+      const base = liveState.value;
       return liveState.produce(
         (draft) => {
-          return assignDraft(draft, current.value) as never;
+          return assignDraft(draft, current.value, base) as never;
         },
         { mutationIds }
       );
