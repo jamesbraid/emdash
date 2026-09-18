@@ -171,6 +171,15 @@ export class WorkspaceRegistryRuntime {
    */
   private muteScans: (id: string) => () => void = () => () => undefined;
   private readonly overlays = new Map<string, WorkspaceRuntimeOverlay>();
+  /**
+   * In-memory mirror of every record's `lastActivatedAt`, kept in step with the store
+   * inside {@link publish} (spec: registry-runtime-per-change-cost): the scan scheduler
+   * asks {@link isWorkspaceActive} once per present record on every watch reconcile, and
+   * that answer must come from memory — a per-id SQLite read there does not scale with
+   * registry size. Mutations are already serialized through {@link enqueue}, so this map
+   * never races the store it mirrors.
+   */
+  private readonly lastActivatedAtById = new Map<string, number | null>();
   private readonly recordsCell: Cell<WorkspaceRecords>;
   private readonly projectConfigPokes = pokeChannel<{ workspaceIds?: readonly string[] }>(
     'workspace-registry:project-config'
@@ -354,6 +363,7 @@ export class WorkspaceRegistryRuntime {
         this.configs.seed(record.id, { config: {}, parseError: false });
       }
       initial[record.id] = this.toWire(record);
+      this.lastActivatedAtById.set(record.id, record.lastActivatedAt);
     }
     for (const record of this.store.list()) {
       const projectRoot = this.projectRootFor(record);
@@ -987,13 +997,19 @@ export class WorkspaceRegistryRuntime {
     }));
   }
 
-  /** Activity escalation gate: activated workspaces (or fresh activations) scan eagerly. */
+  /**
+   * Activity escalation gate: activated workspaces (or fresh activations) scan eagerly.
+   * Answers from memory only (spec: registry-runtime-per-change-cost) — the scan
+   * scheduler calls this once per present record on every watch reconcile, so a SQLite
+   * read here does not scale with registry size. {@link lastActivatedAtById} mirrors the
+   * store's column and is kept current in {@link publish}.
+   */
   isWorkspaceActive(id: string): boolean {
     const overlay = this.overlays.get(id);
     if (overlay?.activation) return true;
-    const record = this.store.get(id);
-    if (!record || record.lastActivatedAt === null) return false;
-    return this.clock.now() - record.lastActivatedAt < 60 * 60_000;
+    const lastActivatedAt = this.lastActivatedAtById.get(id);
+    if (lastActivatedAt === undefined || lastActivatedAt === null) return false;
+    return this.clock.now() - lastActivatedAt < 60 * 60_000;
   }
 
   private async createWorkspaceLocked(
@@ -1462,6 +1478,7 @@ export class WorkspaceRegistryRuntime {
     const deleted = this.store.delete(input.workspaceId);
     if (deleted) {
       this.overlays.delete(input.workspaceId);
+      this.lastActivatedAtById.delete(input.workspaceId);
       this.scanner.evict(input.workspaceId);
       this.configs.delete(input.workspaceId);
       this.recordsCell.update((previous) => {
@@ -1793,6 +1810,7 @@ export class WorkspaceRegistryRuntime {
   }
 
   private publish(record: DurableWorkspaceRecord): void {
+    this.lastActivatedAtById.set(record.id, record.lastActivatedAt);
     const wire = this.toWire(record);
     this.recordsCell.update((previous) => ({ ...previous, [record.id]: wire }));
     const projectRoot = this.projectRootFor(record);
