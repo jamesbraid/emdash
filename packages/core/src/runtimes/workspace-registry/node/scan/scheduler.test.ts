@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { err, ok, type Result } from '@emdash/shared';
-import { deferred, type Deferred } from '@emdash/shared/testing';
+import { createManualClock, deferred, type Deferred } from '@emdash/shared/testing';
 import { describe, expect, it, vi } from 'vitest';
 import type { IWatchService, WatchEvent, WatchOptions } from '#services/fs-watch/api';
 import {
@@ -136,6 +136,7 @@ function createHarness(
   options: {
     debounceMs?: number;
     activeDebounceMs?: number;
+    reconcileDebounceMs?: number;
     pollIntervalMs?: number;
     active?: Set<string>;
     block?: () => Promise<void>;
@@ -151,11 +152,13 @@ function createHarness(
     },
     listTargets: () => targets,
     // Working-tree watches follow activity, so the harness treats every target as active
-    // unless a test supplies its own set. Both debounces then default to the same value so
-    // tests that only tune `debounceMs` keep the timing they were written against.
+    // unless a test supplies its own set. Both scan debounces and the watch-reconcile
+    // debounce then default to the same value so tests that only tune `debounceMs`
+    // keep the timing they were written against.
     isActive: (id) => (options.active ? options.active.has(id) : true),
     debounceMs: options.debounceMs ?? 20,
     activeDebounceMs: options.activeDebounceMs ?? options.debounceMs ?? 20,
+    reconcileDebounceMs: options.reconcileDebounceMs ?? options.debounceMs ?? 20,
     pollIntervalMs: options.pollIntervalMs ?? 60 * 60_000,
   });
   void scheduler.start();
@@ -239,7 +242,11 @@ describe('WorkspaceScanScheduler', () => {
       targets.push(directory);
       scheduler.syncWatches();
       expect(requests).toHaveLength(0);
-      watcher.resolveReady('/plain');
+      // The reconcile itself is now debounced: wait for it to actually register the
+      // watch before resolving its readiness.
+      await eventually(() => {
+        watcher.resolveReady('/plain');
+      });
 
       await eventually(() => {
         expect(requests).toEqual([{ kind: 'workspace', id: 'dir-1', mode: 'full' }]);
@@ -258,7 +265,11 @@ describe('WorkspaceScanScheduler', () => {
     try {
       targets.push(repo, wtA, wtB);
       scheduler.syncWatches();
-      watcher.resolveReady('/repos/main');
+      // The debounced reconcile registers all four watches in one pass; wait for it,
+      // then every resolveReady below finds its watch already in place.
+      await eventually(() => {
+        watcher.resolveReady('/repos/main');
+      });
       watcher.resolveReady(path.join('/repos/main', '.git'));
       watcher.resolveReady('/worktrees/a');
       watcher.resolveReady('/worktrees/b');
@@ -279,6 +290,10 @@ describe('WorkspaceScanScheduler', () => {
     try {
       targets.splice(0, 1);
       scheduler.syncWatches();
+      // The debounced reconcile is what refreshes the scheduler's own view of targets
+      // (the repository's removal); wait for it to land before the emit, or the emit's
+      // fallback computation would still see the stale, present parent.
+      await new Promise((resolve) => setTimeout(resolve, 20));
       watcher.emit(worktree.path, [{ kind: 'update', path: path.join(worktree.path, 'file.txt') }]);
 
       await eventually(() => {
@@ -362,6 +377,55 @@ describe('WorkspaceScanScheduler', () => {
   it('defaults the active debounce to 1 s and the idle debounce to 2 s', () => {
     expect(DEFAULT_SCAN_DEBOUNCE_MS).toBe(2_000);
     expect(DEFAULT_ACTIVE_SCAN_DEBOUNCE_MS).toBe(1_000);
+  });
+
+  it('coalesces a burst of syncWatches() calls inside the debounce window into one reconcile', async () => {
+    const repo = repoTarget('repo-1', '/repos/main');
+    const wt = worktreeTarget('wt-1', '/worktrees/wt', 'repo-1');
+    const clock = createManualClock();
+    const watcher = new FakeWatchService();
+    const isActive = vi.fn((_id: string) => true);
+    const scheduler = new WorkspaceScanScheduler({
+      watcher,
+      execute: async () => {},
+      listTargets: () => [repo, wt],
+      isActive,
+      reconcileDebounceMs: 200,
+      pollIntervalMs: 60 * 60_000,
+      clock,
+    });
+    try {
+      // Readiness never settles for a FakeWatchService that nothing resolves; only the
+      // synchronous half of start()'s reconcile matters here, so don't await it.
+      void scheduler.start();
+      isActive.mockClear();
+
+      // A burst of records-changed notifications, as a scan pass saving 10 records
+      // would produce — every call lands inside the previous call's debounce window.
+      for (let index = 0; index < 10; index += 1) {
+        scheduler.syncWatches();
+      }
+      expect(isActive).not.toHaveBeenCalled();
+
+      await clock.advanceBy(199);
+      expect(isActive).not.toHaveBeenCalled();
+
+      await clock.advanceBy(1);
+      // Exactly one reconcile ran — isActive is asked once per present target, not
+      // once per target per burst call.
+      expect(isActive).toHaveBeenCalledTimes(2);
+      const compare = (left: string, right: string) => left.localeCompare(right);
+      expect(isActive.mock.calls.map(([id]) => id).sort(compare)).toEqual(
+        ['repo-1', 'wt-1'].sort(compare)
+      );
+      // The single trailing reconcile still converges the same watch set a synchronous
+      // reconcile after every call would have produced.
+      expect([...watcher.roots.keys()].sort(compare)).toEqual(
+        [path.join('/repos/main', '.git'), '/repos/main', '/worktrees/wt'].sort(compare)
+      );
+    } finally {
+      await scheduler.dispose();
+    }
   });
 
   it('worktree admin changes trigger repository reconciliation (adoption path)', async () => {
@@ -653,7 +717,9 @@ describe('WorkspaceScanScheduler', () => {
 
       active.add('wt-1');
       scheduler.syncWatches();
-      expect(watcher.roots.has('/worktrees/wt')).toBe(true);
+      await eventually(() => {
+        expect(watcher.roots.has('/worktrees/wt')).toBe(true);
+      });
       expect(requests).toHaveLength(0);
 
       // Changes may have landed while the workspace was idle and unwatched: attaching
@@ -677,7 +743,9 @@ describe('WorkspaceScanScheduler', () => {
 
       active.delete('wt-1');
       scheduler.syncWatches();
-      expect(attempt?.released).toBe(true);
+      await eventually(() => {
+        expect(attempt?.released).toBe(true);
+      });
       expect(watcher.roots.has('/worktrees/wt')).toBe(false);
     } finally {
       await scheduler.dispose();
@@ -711,7 +779,9 @@ describe('WorkspaceScanScheduler', () => {
       ]);
       targets.length = 0;
       scheduler.syncWatches();
-      expect(watcher.roots.size).toBe(0);
+      await eventually(() => {
+        expect(watcher.roots.size).toBe(0);
+      });
     } finally {
       await scheduler.dispose();
     }

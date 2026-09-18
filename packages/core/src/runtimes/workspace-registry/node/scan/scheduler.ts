@@ -1,6 +1,11 @@
 import path from 'node:path';
 import { noopLogger, type Logger } from '@emdash/shared/logger';
-import { systemClock, type Clock } from '@emdash/shared/scheduling';
+import {
+  createDebounced,
+  systemClock,
+  type Clock,
+  type Debounced,
+} from '@emdash/shared/scheduling';
 import { nativePathIdentityKey } from '#primitives/path/api';
 import {
   gitMetadataWatchIgnore,
@@ -45,6 +50,12 @@ export type WorkspaceScanSchedulerOptions = {
   activeDebounceMs?: number;
   /** The freshness floor: no record goes longer than this without a rescan. */
   pollIntervalMs?: number;
+  /**
+   * Trailing coalescing window for {@link WorkspaceScanScheduler#syncWatches}: a burst
+   * of records-changed notifications (one per record saved during a scan pass) folds
+   * into a single reconcile fired this long after the last one in the burst.
+   */
+  reconcileDebounceMs?: number;
 };
 
 export const DEFAULT_SCAN_DEBOUNCE_MS = 2_000;
@@ -55,6 +66,14 @@ export const DEFAULT_SCAN_DEBOUNCE_MS = 2_000;
  */
 export const DEFAULT_ACTIVE_SCAN_DEBOUNCE_MS = 1_000;
 const DEFAULT_POLL_INTERVAL_MS = 5 * 60_000;
+/**
+ * A watch reconcile re-lists every registered record and, per present one, asks the
+ * runtime whether it is active (spec: registry-runtime-per-change-cost). Records change
+ * continuously during a scan pass — this coalesces the resulting reconcile-storm to one
+ * pass per burst; 200 ms trails a burst imperceptibly while cutting reconcile volume by
+ * orders of magnitude on a large registry.
+ */
+export const DEFAULT_RECONCILE_DEBOUNCE_MS = 200;
 
 type PendingScan = {
   request: ScanRequest;
@@ -91,6 +110,13 @@ export class WorkspaceScanScheduler {
   private targetsById = new Map<string, ScanTarget>();
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
+  /**
+   * The trailing coalesce for {@link syncWatches}: a burst of records-changed calls
+   * (up to one per record saved) folds into one `reconcileWatches(true)` fired after
+   * the burst goes quiet. Reconciliation is idempotent, so a trailing run alone still
+   * converges the watch set (spec: registry-runtime-per-change-cost).
+   */
+  private readonly reconcileDebounced: Debounced<void>;
 
   constructor(options: WorkspaceScanSchedulerOptions) {
     this.watcher = options.watcher;
@@ -104,6 +130,10 @@ export class WorkspaceScanScheduler {
     this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     this.contentWatchIgnore = workspaceContentWatchIgnore(options.watchIgnore);
     this.gitMetadataWatchIgnore = gitMetadataWatchIgnore();
+    this.reconcileDebounced = createDebounced(() => void this.reconcileWatches(true), {
+      delayMs: options.reconcileDebounceMs ?? DEFAULT_RECONCILE_DEBOUNCE_MS,
+      clock: this.clock,
+    });
   }
 
   start(): Promise<void> {
@@ -113,9 +143,15 @@ export class WorkspaceScanScheduler {
     return ready;
   }
 
-  /** Called by the runtime after every records change: reconciles watches with targets. */
+  /**
+   * Called by the runtime after every records change: reconciles watches with targets.
+   * Debounced (trailing-only): a burst of calls inside one scan pass — up to one per
+   * record saved — coalesces into a single reconcile once the burst goes quiet, instead
+   * of re-listing every target and re-asking activity per target on each individual
+   * change (spec: registry-runtime-per-change-cost).
+   */
   syncWatches(): void {
-    void this.reconcileWatches(true);
+    this.reconcileDebounced.call(undefined);
   }
 
   private reconcileWatches(reconcileOnReady: boolean): Promise<void> {
@@ -205,6 +241,7 @@ export class WorkspaceScanScheduler {
   async dispose(): Promise<void> {
     this.disposed = true;
     if (this.pollTimer !== null) clearInterval(this.pollTimer);
+    this.reconcileDebounced.cancel();
     for (const pending of this.pending.values()) clearTimeout(pending.timer);
     this.pending.clear();
     const handles = [...this.watches.values()];
