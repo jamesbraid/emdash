@@ -12,7 +12,7 @@ export function publishStructural<T>(
   if (Object.is(current, next)) return revisionOf(target);
 
   const updated = produce(current, (draft) => {
-    const replacement = assignDraft(draft as T, next);
+    const replacement = assignDraft(draft as T, next, current);
     if (replacement !== undefined) return replacement as never;
   }) as T;
   if (Object.is(current, updated)) return revisionOf(target);
