@@ -156,6 +156,10 @@ export class FrontendPty {
       letterSpacing: TERMINAL_LETTER_SPACING,
       allowProposedApi: true,
       scrollOnUserInput: false,
+      // Force a terminal-local selection on Option-drag so text can be selected and
+      // copied even when the app enables mouse reporting (codex, tmux, vim); otherwise
+      // the app captures the drag and xterm never makes a selection to copy.
+      macOptionClickForcesSelection: true,
       linkHandler: {
         activate: (_event: MouseEvent, text: string) => {
           if (!isPrimaryMouseButton(_event)) return;
