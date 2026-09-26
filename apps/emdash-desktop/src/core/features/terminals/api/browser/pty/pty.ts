@@ -1,4 +1,5 @@
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { WebglAddon } from '@xterm/addon-webgl';
 import { Terminal, type ITerminalOptions } from '@xterm/xterm';
 import {
   FileLinkProvider,
@@ -91,11 +92,11 @@ export function buildTheme(theme?: SessionTheme): ITerminalOptions['theme'] {
  * sets up ongoing data delivery without any renderer-side buffer.
  *
  * DOM management is handled via mount() / unmount():
- *  - mount()   → appends ownedContainer to the visible mount target and
- *                resumes parked output
- *  - unmount() → moves ownedContainer back to the off-screen host and starts
- *                the output linger; once it expires the output transport is
- *                parked while the replica keeps its offset
+ *  - mount()   → appends ownedContainer to the visible mount target, attaches
+ *                the WebGL (GPU) renderer, and resumes parked output
+ *  - unmount() → disposes the WebGL renderer, moves ownedContainer back to the
+ *                off-screen host, and starts the output linger; once it expires
+ *                the output transport is parked while the replica keeps its offset
  *
  * Lifecycle: created and owned by PtySession (stores/pty-session.ts), one per
  * live session. Survives React component unmounts (e.g. navigating away from a
@@ -113,6 +114,8 @@ export class FrontendPty {
   private offData: (() => void) | null = null;
   private readonly output: ParkedOutput;
   private disposed = false;
+  /** GPU renderer, held only while mounted; see mount()/unmount() and loadWebgl(). */
+  private webgl: WebglAddon | undefined;
 
   constructor(
     readonly sessionId: string,
@@ -171,8 +174,11 @@ export class FrontendPty {
       theme: buildTheme(theme),
     });
 
-    // Keep xterm on its DOM renderer: CanvasAddon repaints the full canvas on resize,
-    // which makes panel/sidebar transitions visibly flicker.
+    // Constructed on xterm's DOM renderer; mount() attaches the WebGL (GPU)
+    // renderer and unmount() disposes it, so only visible terminals hold a WebGL
+    // context. A persistent canvas renderer was avoided here because CanvasAddon
+    // repaints the full canvas on resize and flickered panel/sidebar transitions;
+    // the WebGL addon is loaded per-mount instead.
 
     const webLinksAddon = new WebLinksAddon((event, uri) => {
       if (!isPrimaryMouseButton(event)) return;
@@ -279,6 +285,7 @@ export class FrontendPty {
     }
     mountTarget.appendChild(this.ownedContainer);
     this.output.mount();
+    this.loadWebgl();
     // Force a repaint after reparenting in the DOM.
     const t = this.terminal;
     requestAnimationFrame(() => {
@@ -287,6 +294,38 @@ export class FrontendPty {
         t.refresh(0, t.rows - 1);
       } catch {}
     });
+  }
+
+  /**
+   * Attach xterm's WebGL renderer for the visible mount, unless one is already
+   * held or the session is disposed. Only visible terminals hold a GPU context:
+   * Chrome caps live WebGL contexts at ~16 and this app keeps 40+ terminals
+   * alive, so unmount() disposes it again.
+   *
+   * On context loss the addon reverts the terminal to its DOM renderer; we
+   * dispose it and clear the field rather than auto-reload, so the next mount
+   * re-acquires a context. If WebGL is unavailable or the context cap is hit,
+   * loading throws and we fall back to the DOM renderer for this mount.
+   */
+  private loadWebgl(): void {
+    if (this.webgl || this.disposed) return;
+    try {
+      const addon = new WebglAddon();
+      addon.onContextLoss(() => {
+        try {
+          addon.dispose();
+        } catch {}
+        this.webgl = undefined;
+      });
+      this.terminal.loadAddon(addon);
+      this.webgl = addon;
+    } catch (error) {
+      this.webgl = undefined;
+      log.warn('FrontendPty: failed to load WebGL renderer', {
+        sessionId: this.sessionId,
+        error,
+      });
+    }
   }
 
   /**
@@ -306,6 +345,12 @@ export class FrontendPty {
    * like a first open.
    */
   unmount(): void {
+    // Free the GPU context so only visible terminals hold one (Chrome caps live
+    // WebGL contexts at ~16 while this app keeps 40+ terminals alive).
+    try {
+      this.webgl?.dispose();
+    } catch {}
+    this.webgl = undefined;
     ensureXtermHost().appendChild(this.ownedContainer);
     this.output.unmount();
   }
@@ -322,6 +367,10 @@ export class FrontendPty {
     this.output.dispose();
     this.offData?.();
     this.offData = null;
+    try {
+      this.webgl?.dispose();
+    } catch {}
+    this.webgl = undefined;
     try {
       this.terminal.dispose();
     } catch {}

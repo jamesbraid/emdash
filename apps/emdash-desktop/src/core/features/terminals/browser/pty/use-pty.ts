@@ -71,10 +71,10 @@ export type PasteFromClipboardHandler = (helpers: {
  * React hook that manages a full xterm.js terminal instance attached to
  * `containerRef`, wired to a PTY session via the deterministic `sessionId`.
  *
- * Each session owns a persistent FrontendPty (terminal + Canvas2D renderer)
- * for its full lifetime.  On unmount the terminal's ownedContainer is
- * reparented to the off-screen xterm host rather than disposed, so scrollback
- * is preserved across tab switches.
+ * Each session owns a persistent FrontendPty for its full lifetime; while
+ * mounted it paints to the GPU via xterm's WebGL renderer.  On unmount the
+ * terminal's ownedContainer is reparented to the off-screen xterm host rather
+ * than disposed, so scrollback is preserved across tab switches.
  *
  * For sessions pre-registered via PtySessionProvider the mount is effectively
  * synchronous (no await needed).  Standalone sessions (not pre-registered)
